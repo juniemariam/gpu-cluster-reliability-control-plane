@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: gpuops-controller, namespace: gpuops}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: gpuops-controller}
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, patch, create]
+  - apiGroups: [gpuops.nvidia.example]
+    resources: [gpuworkloads, gpuworkloads/status]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: gpuops-controller}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: gpuops-controller}
+subjects: [{kind: ServiceAccount, name: gpuops-controller, namespace: gpuops}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: gpuops-workload-controller, namespace: gpuops}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: gpuops-workload-controller}}
+  template:
+    metadata: {labels: {app: gpuops-workload-controller}}
+    spec:
+      serviceAccountName: gpuops-controller
+      containers:
+        - name: workload-controller
+          image: gpu-cluster-ops:recruiter-fix
+          imagePullPolicy: Never
+          command: ["python3", "controllers/workload_controller.py"]
+          env:
+            - {name: PYTHONPATH, value: /app}
+            - {name: K8S_NAMESPACE, value: gpuops}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: gpuops-reliability-controller, namespace: gpuops}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: gpuops-reliability-controller}}
+  template:
+    metadata: {labels: {app: gpuops-reliability-controller}}
+    spec:
+      serviceAccountName: gpuops-controller
+      containers:
+        - name: controller
+          image: gpu-cluster-ops:dev
+          command: ["python3", "controllers/reliability_controller.py"]
+          env: [{name: K8S_NAMESPACE, value: gpuops}]

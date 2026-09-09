@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: gpuops}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: gpu-cluster-ops, namespace: gpuops}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: gpu-cluster-ops}}
+  template:
+    metadata: {labels: {app: gpu-cluster-ops}}
+    spec:
+      runtimeClassName: nvidia
+      containers:
+        - name: platform
+          image: gpu-cluster-ops:recruiter-fix
+          imagePullPolicy: Never
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          ports: [{containerPort: 8000}]
+          env:
+            - {name: CLUSTER_MODE, value: real}
+            - {name: DATABASE_URL, value: postgresql+psycopg://cluster:change-me@gpuops-postgres:5432/gpuops}
+            - {name: AUTH_ENABLED, value: "false"}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: gpu-cluster-ops, namespace: gpuops}
+spec:
+  selector: {app: gpu-cluster-ops}
+  ports: [{port: 8000, targetPort: 8000}]
+
+

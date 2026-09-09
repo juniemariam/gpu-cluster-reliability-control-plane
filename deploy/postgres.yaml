@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: gpuops}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: gpuops-db, namespace: gpuops}
+type: Opaque
+stringData:
+  POSTGRES_USER: cluster
+  POSTGRES_PASSWORD: change-me
+  POSTGRES_DB: gpuops
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: gpuops-postgres, namespace: gpuops}
+spec:
+  serviceName: gpuops-postgres
+  replicas: 1
+  selector: {matchLabels: {app: gpuops-postgres}}
+  template:
+    metadata: {labels: {app: gpuops-postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports: [{containerPort: 5432}]
+          envFrom: [{secretRef: {name: gpuops-db}}]
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 5Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: gpuops-postgres, namespace: gpuops}
+spec:
+  selector: {app: gpuops-postgres}
+  ports: [{port: 5432, targetPort: 5432}]

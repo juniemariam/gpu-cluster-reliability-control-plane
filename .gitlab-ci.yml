@@ -1,0 +1,35 @@
+stages: [lint, test, build, security]
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths: [.cache/pip]
+
+lint:
+  image: python:3.12-slim
+  stage: lint
+  script:
+    - pip install -r requirements.txt
+    - python -m compileall -q app tests scripts
+
+unit-tests:
+  image: python:3.12-slim
+  stage: test
+  script:
+    - pip install -r requirements.txt
+    - python -m unittest discover -s tests -v
+
+container-build:
+  image: docker:27
+  services: [docker:27-dind]
+  stage: build
+  script:
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" .
+
+container-scan:
+  image: aquasec/trivy:latest
+  stage: security
+  allow_failure: true
+  script:
+    - trivy fs --exit-code 0 --severity HIGH,CRITICAL .

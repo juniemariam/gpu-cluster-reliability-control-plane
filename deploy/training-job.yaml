@@ -1,0 +1,19 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-training-smoke
+  namespace: gpuops
+  labels: {app: gpu-training, gpuops/job: gpu-training-smoke}
+spec:
+  backoffLimit: 2
+  template:
+    metadata: {labels: {app: gpu-training, gpuops/job: gpu-training-smoke}}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: gpu-cluster-ops:recruiter-fix
+          imagePullPolicy: Never
+          command: ["python3", "training/train.py", "--steps", "100"]
+          resources:
+            limits: {nvidia.com/gpu: "1"}

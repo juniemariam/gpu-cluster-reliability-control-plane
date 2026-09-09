@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cluster
+      POSTGRES_PASSWORD: cluster
+      POSTGRES_DB: gpuops
+    volumes:
+      - gpuops-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cluster -d gpuops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  platform:
+    build: ..
+    ports: ["8000:8000"]
+    environment:
+      CLUSTER_MODE: ${CLUSTER_MODE:-simulated}
+      DATABASE_URL: postgresql+psycopg://cluster:cluster@postgres:5432/gpuops
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: [cpu]
+  platform-gpu:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gpu
+    ports: ["8002:8000"]
+    environment:
+      CLUSTER_MODE: real
+      DATABASE_URL: postgresql+psycopg://cluster:cluster@postgres:5432/gpuops
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles: [gpu]
+
+volumes:
+  gpuops-postgres:

@@ -1,0 +1,9 @@
+[project]
+name = "gpu-cluster-ops"
+version = "0.1.0"
+description = "GPU cluster validation, scheduling, observability, and agentic remediation platform"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

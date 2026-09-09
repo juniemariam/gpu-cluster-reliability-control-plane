@@ -1,0 +1,2 @@
+# Optional local GPU validation dependency. Choose the CUDA wheel matching your driver.
+torch>=2.5
