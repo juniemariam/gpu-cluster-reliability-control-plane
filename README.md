@@ -123,7 +123,7 @@ deploy/
 These commands target the native k3s cluster inside Ubuntu WSL2. Keep the existing project directory on Windows; WSL accesses it through `/mnt/c`.
 
 ```bash
-cd "/mnt/c/Users/George/Downloads/GPU Cluster Reliability Control Plane"
+cd "/mnt/c/Users/Junie/Downloads/GPU Cluster Reliability Control Plane"
 
 # The image must already be imported into k3s containerd.
 sudo k3s kubectl apply -f deploy/postgres.yaml
@@ -182,14 +182,3 @@ Interactive API documentation is available at `/docs`.
 
 This is a portfolio-scale control plane, not a replacement for a production scheduler. Durable workload state, idempotent replay protection, a Kubernetes workload CRD, and Lease-based controller leadership are implemented. Remaining production-hardening work includes a real queue, actual model checkpoint save/restore, highly available PostgreSQL, stronger authentication and authorization, structured logs, Prometheus/Grafana dashboards, alert routing, network policies, image signing, and multi-node testing.
 
-## Resume-ready description
-
-**GPU Cluster Reliability Control Plane** — Built a FastAPI and Kubernetes-based GPU operations platform that discovers NVIDIA hardware, schedules prioritized CUDA workloads, persists workload and audit state in PostgreSQL, protects submissions with idempotency keys, injects GPU-memory failures, and reconciles incidents through reliability controllers with Kubernetes Lease leadership. Deployed real GPU workloads on native k3s with NVIDIA Container Toolkit and the Kubernetes device plugin.
-
-## Name recommendation
-
-Recommended product name: **GPU Cluster Reliability Control Plane**
-
-Recommended repository slug: `gpu-cluster-reliability-control-plane`
-
-For now, keeping the existing local folder name avoids breaking your current commands. Rename the GitHub repository and folder only after the demo is stable.
