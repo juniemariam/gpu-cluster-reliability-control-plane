@@ -18,6 +18,8 @@ Research teams need reliable access to GPU clusters without manually inspecting 
 - exposes a FastAPI API and operator dashboard;
 - runs locally with Docker Compose or on Kubernetes/k3s.
 
+<img width="1165" height="1206" alt="image" src="https://github.com/user-attachments/assets/3df91040-bbbe-4147-855c-9250de19cf42" />
+
 ## Architecture at a glance
 
 ```text
@@ -177,6 +179,7 @@ The Compose GPU service is exposed at `http://127.0.0.1:8002`.
 | `GET /metrics` | Prometheus-compatible metrics |
 
 Interactive API documentation is available at `/docs`.
+<img width="1171" height="1341" alt="image" src="https://github.com/user-attachments/assets/8c582684-bcba-48eb-93ca-6d8330c87319" />
 
 ## Limitations and production next steps
 
