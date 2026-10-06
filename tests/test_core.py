@@ -4,6 +4,7 @@ from app.cluster import Cluster
 from app.models import Job, JobState
 from app.scheduler import Scheduler
 from app.validator import Validator
+from app.inference import InferenceManager, InferenceService
 
 class PlatformTests(unittest.TestCase):
     def setUp(self): self.cluster = Cluster("simulated")
@@ -18,5 +19,20 @@ class PlatformTests(unittest.TestCase):
         self.cluster.inject("gpu-sim-01", "node_unhealthy")
         result = AIOpsAgent(self.cluster).reconcile()
         self.assertTrue(result["actions"]); self.assertEqual(self.cluster.nodes["gpu-sim-01"].state.value, "ready")
+
+    def test_mock_inference_service_returns_openai_shape(self):
+        manager = InferenceManager()
+        manager.register(InferenceService("rick", "llama-3.1-8b", runtime="mock"))
+        response = manager.chat("rick", {"messages": [{"role": "user", "content": "hello"}]})
+        self.assertEqual(response["object"], "chat.completion")
+        self.assertEqual(response["model"], "llama-3.1-8b")
+        self.assertGreater(response["usage"]["completion_tokens"], 0)
+        self.assertEqual(manager.request_count, 1)
+
+    def test_duplicate_inference_service_is_rejected(self):
+        manager = InferenceManager()
+        manager.register(InferenceService("demo", "model"))
+        with self.assertRaises(ValueError):
+            manager.register(InferenceService("demo", "model"))
 
 if __name__ == "__main__": unittest.main()

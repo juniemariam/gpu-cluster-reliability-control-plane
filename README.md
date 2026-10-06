@@ -18,6 +18,8 @@ Research teams need reliable access to GPU clusters without manually inspecting 
 - exposes a FastAPI API and operator dashboard;
 - runs locally with Docker Compose or on Kubernetes/k3s.
 
+<img width="1165" height="1206" alt="image" src="https://github.com/user-attachments/assets/3df91040-bbbe-4147-855c-9250de19cf42" />
+
 ## Architecture at a glance
 
 ```text
@@ -81,6 +83,27 @@ The dashboard can submit a CUDA job and launch the packaged GPU worker. The work
 ### Reliability and AIOps
 
 Operators can inject GPU-memory pressure. The validator turns abnormal telemetry into incidents with evidence and a recommended action. The AIOps agent reconciles incidents and records remediation actions such as `drain_node_and_clear_workloads`.
+
+### Inference service foundation
+
+The control plane also exposes a first inference-service boundary. Services can
+use the deterministic `mock` runtime for CPU development or an
+`openai-compatible` runtime for vLLM, SGLang, TGI, or another compatible
+server. This milestone supports service registration, lifecycle state,
+non-streaming chat completions, and token/request counters. Streaming,
+continuous batching, and Kubernetes model deployment are next steps.
+
+Example local flow:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/inference/services \
+  -H 'content-type: application/json' \
+  -d '{"name":"rick","model":"llama-3.1-8b","runtime":"mock"}'
+
+curl -X POST http://localhost:8000/api/v1/inference/services/rick/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}]}'
+```
 
 ### Persistence and auditability
 
@@ -174,11 +197,15 @@ The Compose GPU service is exposed at `http://127.0.0.1:8002`.
 | `POST /api/v1/jobs/{id}/checkpoint` | Record checkpoint metadata and requeue state |
 | `POST /api/v1/failures` | Inject a test failure |
 | `POST /api/v1/agent/reconcile` | Detect and remediate incidents |
+| `POST /api/v1/inference/services` | Register an inference service |
+| `GET /api/v1/inference/services` | List inference services |
+| `POST /api/v1/inference/services/{name}/chat/completions` | Send a chat completion request |
+| `POST /api/v1/inference/services/{name}/stop` | Stop an inference service |
 | `GET /metrics` | Prometheus-compatible metrics |
 
 Interactive API documentation is available at `/docs`.
+<img width="1171" height="1341" alt="image" src="https://github.com/user-attachments/assets/8c582684-bcba-48eb-93ca-6d8330c87319" />
 
 ## Limitations and production next steps
 
 This is a portfolio-scale control plane, not a replacement for a production scheduler. Durable workload state, idempotent replay protection, a Kubernetes workload CRD, and Lease-based controller leadership are implemented. Remaining production-hardening work includes a real queue, actual model checkpoint save/restore, highly available PostgreSQL, stronger authentication and authorization, structured logs, Prometheus/Grafana dashboards, alert routing, network policies, image signing, and multi-node testing.
-

@@ -11,6 +11,7 @@ from .persistence import init_db, record_audit, record_job, record_incident, upd
 from .llm_agent import AgenticPlanner
 from .slurm import SlurmScheduler
 from .kubernetes_adapter import KubernetesAdapter
+from .inference import InferenceManager, InferenceService, default_endpoint
 from pathlib import Path
 import subprocess
 import sys
@@ -19,8 +20,9 @@ import logging
 BASE_DIR = Path(__file__).parent
 logger = logging.getLogger("gpu-cluster-ops")
 
-app = FastAPI(title="GPU Cluster Operations Platform", version="0.2.0")
+app = FastAPI(title="GPU Cluster Operations Platform", version="0.3.0")
 cluster = Cluster(); scheduler = Scheduler(cluster); agent = AIOpsAgent(cluster)
+inference = InferenceManager()
 processes = {}
 
 @app.on_event("startup")
@@ -38,11 +40,27 @@ def node_json(node):
 def job_json(job):
     return {**job.__dict__, "state": job.state.value, "created_at": job.created_at.isoformat()}
 
+def inference_json(service):
+    return {**service.__dict__, "state": service.state.value, "created_at": service.created_at.isoformat(), "updated_at": service.updated_at.isoformat()}
+
 class JobRequest(BaseModel):
     name: str; image: str = "python:3.12-slim"; gpu_count: int = Field(ge=1, le=16); priority: int = Field(default=0, ge=0, le=100); command: list[str] = []; idempotency_key: str | None = Field(default=None, max_length=200); max_retries: int = Field(default=3, ge=0, le=10)
 class FailureRequest(BaseModel):
     node_id: str; kind: str; value: float | None = None
 class TokenRequest(BaseModel): username: str; password: str
+class InferenceServiceRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    model: str = Field(min_length=1, max_length=300)
+    runtime: str = "mock"
+    endpoint: str | None = None
+    replicas: int = Field(default=1, ge=1, le=100)
+    gpu_count: int = Field(default=1, ge=1, le=16)
+class ChatCompletionRequest(BaseModel):
+    messages: list[dict]
+    model: str | None = None
+    temperature: float = Field(default=0.0, ge=0, le=2)
+    max_tokens: int | None = Field(default=None, ge=1, le=32768)
+    stream: bool = False
 
 @app.get("/api/v1/cluster/health")
 def cluster_health(user=Depends(current_user)):
@@ -163,6 +181,50 @@ def kubernetes_submit(req: JobRequest, steps: int = 100, user=Depends(require_ro
 @app.get("/api/v1/kubernetes/jobs")
 def kubernetes_jobs(user=Depends(current_user)): return KubernetesAdapter().list_training_jobs()
 
+@app.post("/api/v1/inference/services")
+def create_inference_service(req: InferenceServiceRequest, user=Depends(require_role("researcher", "operator", "admin"))):
+    try:
+        service = inference.register(InferenceService(req.name, req.model, req.runtime, req.endpoint or default_endpoint(), req.replicas, req.gpu_count))
+    except ValueError as exc:
+        raise HTTPException(409 if "already exists" in str(exc) else 400, str(exc))
+    record_audit(user["sub"], "inference.service_created", service.name, {"model": service.model, "runtime": service.runtime, "gpu_count": service.gpu_count})
+    return inference_json(service)
+
+@app.get("/api/v1/inference/services")
+def list_inference_services(user=Depends(current_user)):
+    return {"items": [inference_json(service) for service in inference.services.values()]}
+
+@app.get("/api/v1/inference/services/{name}")
+def get_inference_service(name: str, user=Depends(current_user)):
+    try:
+        return inference_json(inference.get(name))
+    except KeyError:
+        raise HTTPException(404, "inference service not found")
+
+@app.post("/api/v1/inference/services/{name}/stop")
+def stop_inference_service(name: str, user=Depends(require_role("operator", "admin"))):
+    try:
+        service = inference.stop(name)
+    except KeyError:
+        raise HTTPException(404, "inference service not found")
+    record_audit(user["sub"], "inference.service_stopped", name)
+    return inference_json(service)
+
+@app.post("/api/v1/inference/services/{name}/chat/completions")
+def chat_completion(name: str, req: ChatCompletionRequest, user=Depends(current_user)):
+    if req.stream:
+        raise HTTPException(501, "streaming is planned for the next inference milestone")
+    try:
+        response = inference.chat(name, req.model_dump(exclude_none=True))
+    except KeyError:
+        raise HTTPException(404, "inference service not found")
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    except Exception as exc:
+        logger.exception("inference_request_failed service=%s", name)
+        raise HTTPException(502, f"inference runtime failed: {type(exc).__name__}")
+    return response
+
 @app.get("/api/v1/audit")
 def audit(user=Depends(require_role("admin"))):
     with SessionLocal() as db:
@@ -177,6 +239,23 @@ def metrics():
     for n in cluster.nodes.values():
         for g in n.gpus:
             lines += [f'gpu_utilization_percent{{node="{n.id}",gpu="{g.id}"}} {g.utilization_pct}', f'gpu_memory_used_mb{{node="{n.id}",gpu="{g.id}"}} {g.memory_used_mb}', f'gpu_temperature_celsius{{node="{n.id}",gpu="{g.id}"}} {g.temperature_c}', f'gpu_power_watts{{node="{n.id}",gpu="{g.id}"}} {g.power_usage_w}']
+    lines += [
+        "# HELP inference_requests_total Total inference requests",
+        "# TYPE inference_requests_total counter",
+        f"inference_requests_total {inference.request_count}",
+        "# HELP inference_request_errors_total Total failed inference requests",
+        "# TYPE inference_request_errors_total counter",
+        f"inference_request_errors_total {inference.error_count}",
+        "# HELP inference_prompt_tokens_total Total prompt tokens processed",
+        "# TYPE inference_prompt_tokens_total counter",
+        f"inference_prompt_tokens_total {inference.total_prompt_tokens}",
+        "# HELP inference_completion_tokens_total Total completion tokens generated",
+        "# TYPE inference_completion_tokens_total counter",
+        f"inference_completion_tokens_total {inference.total_completion_tokens}",
+        "# HELP inference_services_total Registered inference services",
+        "# TYPE inference_services_total gauge",
+        f"inference_services_total {len(inference.services)}",
+    ]
     return "\n".join(lines) + "\n"
 
 @app.get("/")
