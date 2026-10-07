@@ -127,6 +127,20 @@ depth, and marks the service `ready` or `unavailable`. These signals are
 exposed through the service API and Prometheus metrics. The local implementation
 uses one real vLLM backend; multi-replica routing remains future work.
 
+### Inference routing policies
+
+The control plane now includes a routing-decision layer with three policies:
+
+- `round-robin`: rotate across ready logical replicas;
+- `load-aware`: choose the replica with the lowest queue depth;
+- `kv-cache-aware`: prefer the highest reported KV-cache utilization when queue
+  depth is comparable.
+
+On the local workstation these are logical replicas used to evaluate routing
+behavior. They do not imply that three independent vLLM processes are running
+on one GPU. The routing API returns the policy, selected replica, decision
+reason, queue depth, and KV-cache signal used by the decision.
+
 ## Runtime modes
 
 ### Real GPU mode
@@ -342,6 +356,7 @@ PostgreSQL stores job, incident, and audit records. This gives the demo an opera
 app/
   api.py                    FastAPI routes and lifecycle
   inference.py              Inference service registry and runtime adapters
+  routing.py                Round-robin, load-aware, and KV-cache-aware routing
   cluster.py                Real/simulated GPU discovery and telemetry
   scheduler.py              GPU-aware job admission and lifecycle
   agent.py                  Reliability reconciliation logic
@@ -433,6 +448,7 @@ The Compose GPU service is exposed at `http://127.0.0.1:8002`.
 | `GET /api/v1/inference/services` | List inference services |
 | `GET /api/v1/inference/services/{name}` | Inspect service state and performance |
 | `GET /api/v1/inference/services/{name}/health` | Probe backend health and update service state |
+| `POST /api/v1/inference/services/{name}/route` | Compare routing policies using logical replica metrics |
 | `POST /api/v1/inference/services/{name}/chat/completions` | Send a chat completion request; supports `stream: true` |
 | `POST /api/v1/inference/services/{name}/stop` | Stop an inference service |
 | `GET /metrics` | Prometheus-compatible metrics |

@@ -1,30 +1,57 @@
 import unittest
+
 from app.agent import AIOpsAgent
 from app.cluster import Cluster
+from app.inference import InferenceManager, InferenceService
 from app.models import Job, JobState
+from app.reliability_experiment import run_reliability_experiment
+from app.routing import InferenceRouter
 from app.scheduler import Scheduler
 from app.validator import Validator
-from app.inference import InferenceManager, InferenceService
-from app.reliability_experiment import run_reliability_experiment
+
 
 class PlatformTests(unittest.TestCase):
-    def setUp(self): self.cluster = Cluster("simulated")
+    def setUp(self):
+        self.cluster = Cluster("simulated")
+
     def test_scheduler_assigns_priority_job(self):
-        s = Scheduler(self.cluster); high = s.submit(Job("high", "demo", 1, priority=10)); low = s.submit(Job("low", "demo", 1, priority=1))
-        self.assertEqual(high.state, JobState.RUNNING); self.assertEqual(low.state, JobState.RUNNING)
+        scheduler = Scheduler(self.cluster)
+        high = scheduler.submit(Job("high", "demo", 1, priority=10))
+        low = scheduler.submit(Job("low", "demo", 1, priority=1))
+
+        self.assertEqual(high.state, JobState.RUNNING)
+        self.assertEqual(low.state, JobState.RUNNING)
+
     def test_validator_detects_pressure(self):
         self.cluster.inject("gpu-sim-01", "gpu_memory_pressure", 95)
         results = Validator().validate(self.cluster)
-        self.assertFalse(results[0]["healthy"]); self.assertTrue(any("memory" in x["name"] for x in results[0]["checks"]))
+
+        self.assertFalse(results[0]["healthy"])
+        self.assertTrue(
+            any("memory" in check["name"] for check in results[0]["checks"])
+        )
+
     def test_agent_recovers_unhealthy_node(self):
         self.cluster.inject("gpu-sim-01", "node_unhealthy")
         result = AIOpsAgent(self.cluster).reconcile()
-        self.assertTrue(result["actions"]); self.assertEqual(self.cluster.nodes["gpu-sim-01"].state.value, "ready")
+
+        self.assertTrue(result["actions"])
+        self.assertEqual(
+            self.cluster.nodes["gpu-sim-01"].state.value,
+            "ready",
+        )
 
     def test_mock_inference_service_returns_openai_shape(self):
         manager = InferenceManager()
-        manager.register(InferenceService("rick", "llama-3.1-8b", runtime="mock"))
-        response = manager.chat("rick", {"messages": [{"role": "user", "content": "hello"}]})
+        manager.register(
+            InferenceService("rick", "llama-3.1-8b", runtime="mock")
+        )
+
+        response = manager.chat(
+            "rick",
+            {"messages": [{"role": "user", "content": "hello"}]},
+        )
+
         self.assertEqual(response["object"], "chat.completion")
         self.assertEqual(response["model"], "llama-3.1-8b")
         self.assertGreater(response["usage"]["completion_tokens"], 0)
@@ -33,6 +60,7 @@ class PlatformTests(unittest.TestCase):
     def test_duplicate_inference_service_is_rejected(self):
         manager = InferenceManager()
         manager.register(InferenceService("demo", "model"))
+
         with self.assertRaises(ValueError):
             manager.register(InferenceService("demo", "model"))
 
@@ -63,18 +91,95 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(service.health_failures, 1)
         self.assertEqual(service.last_health_error, "ConnectError")
 
+    def test_round_robin_router_rotates_logical_replicas(self):
+        router = InferenceRouter()
+        router.register("demo", 3)
+
+        selected = [
+            router.choose("demo", "round-robin")["replica"]
+            for _ in range(4)
+        ]
+
+        self.assertEqual(
+            selected,
+            [
+                "demo-replica-0",
+                "demo-replica-1",
+                "demo-replica-2",
+                "demo-replica-0",
+            ],
+        )
+
+    def test_load_aware_router_selects_lowest_queue(self):
+        router = InferenceRouter()
+        router.register("demo", 2)
+        router.update_replica(
+            "demo",
+            "demo-replica-0",
+            queue_depth=5,
+        )
+        router.update_replica(
+            "demo",
+            "demo-replica-1",
+            queue_depth=1,
+        )
+
+        decision = router.choose("demo", "load-aware")
+
+        self.assertEqual(decision["replica"], "demo-replica-1")
+
+    def test_kv_cache_aware_router_prefers_cached_replica(self):
+        router = InferenceRouter()
+        router.register("demo", 2)
+        router.update_replica(
+            "demo",
+            "demo-replica-0",
+            queue_depth=1,
+            kv_cache_utilization=0.2,
+        )
+        router.update_replica(
+            "demo",
+            "demo-replica-1",
+            queue_depth=1,
+            kv_cache_utilization=0.8,
+        )
+
+        decision = router.choose("demo", "kv-cache-aware")
+
+        self.assertEqual(decision["replica"], "demo-replica-1")
+        self.assertEqual(
+            decision["execution_mode"],
+            "logical-replica-simulation",
+        )
+
     def test_openai_runtime_requires_endpoint_at_request_time(self):
         manager = InferenceManager()
-        manager.register(InferenceService("vllm", "model", runtime="vllm"))
+        manager.register(
+            InferenceService("vllm", "model", runtime="vllm")
+        )
+
         with self.assertRaises(ValueError):
-            manager.chat("vllm", {"messages": [{"role": "user", "content": "hello"}]})
+            manager.chat(
+                "vllm",
+                {"messages": [{"role": "user", "content": "hello"}]},
+            )
 
     def test_mock_stream_records_latency_and_throughput(self):
         manager = InferenceManager()
         manager.register(InferenceService("stream", "demo-model"))
-        chunks = list(manager.stream_chat("stream", {"messages": [{"role": "user", "content": "hello"}]}))
-        self.assertTrue(any("chat.completion.chunk" in chunk for chunk in chunks))
+
+        chunks = list(
+            manager.stream_chat(
+                "stream",
+                {"messages": [{"role": "user", "content": "hello"}]},
+            )
+        )
+
+        self.assertTrue(
+            any("chat.completion.chunk" in chunk for chunk in chunks)
+        )
         self.assertTrue(chunks[-1].startswith("data: [DONE]"))
+
         service = manager.get("stream")
         self.assertEqual(service.requests, 1)
         self.assertGreater(service.completion_tokens, 0)
@@ -83,6 +188,7 @@ class PlatformTests(unittest.TestCase):
 
     def test_reliability_experiment_measures_recovery_and_no_false_positives(self):
         result = run_reliability_experiment(trials=3)
+
         self.assertEqual(result.trials, 3)
         self.assertGreaterEqual(result.failure_detection_seconds, 0)
         self.assertGreaterEqual(result.drain_initiation_seconds, 0)
@@ -90,4 +196,6 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(result.workloads_affected, 1)
         self.assertEqual(result.false_positive_rate, 0)
 
-if __name__ == "__main__": unittest.main()
+
+if __name__ == "__main__":
+    unittest.main()

@@ -12,6 +12,7 @@ from .llm_agent import AgenticPlanner
 from .slurm import SlurmScheduler
 from .kubernetes_adapter import KubernetesAdapter
 from .inference import InferenceManager, InferenceService, default_endpoint
+from .routing import InferenceRouter, RoutingPolicy
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +24,7 @@ logger = logging.getLogger("gpu-cluster-ops")
 app = FastAPI(title="GPU Cluster Operations Platform", version="0.3.0")
 cluster = Cluster(); scheduler = Scheduler(cluster); agent = AIOpsAgent(cluster, scheduler)
 inference = InferenceManager()
+router = InferenceRouter()
 processes = {}
 
 @app.on_event("startup")
@@ -64,6 +66,14 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0, le=2)
     max_tokens: int | None = Field(default=None, ge=1, le=32768)
     stream: bool = False
+class ReplicaMetric(BaseModel):
+    name: str
+    queue_depth: int = Field(default=0, ge=0)
+    kv_cache_utilization: float = Field(default=0.0, ge=0, le=1)
+    state: str = "ready"
+class RouteRequest(BaseModel):
+    policy: str = "round-robin"
+    replicas: list[ReplicaMetric] = []
 
 @app.get("/api/v1/cluster/health")
 def cluster_health(user=Depends(current_user)):
@@ -188,6 +198,7 @@ def kubernetes_jobs(user=Depends(current_user)): return KubernetesAdapter().list
 def create_inference_service(req: InferenceServiceRequest, user=Depends(require_role("researcher", "operator", "admin"))):
     try:
         service = inference.register(InferenceService(req.name, req.model, req.runtime, req.endpoint or default_endpoint(), req.replicas, req.gpu_count))
+        router.register(service.name, service.replicas)
     except ValueError as exc:
         raise HTTPException(409 if "already exists" in str(exc) else 400, str(exc))
     record_audit(user["sub"], "inference.service_created", service.name, {"model": service.model, "runtime": service.runtime, "gpu_count": service.gpu_count})
@@ -210,6 +221,21 @@ def inference_health(name: str, user=Depends(current_user)):
         return inference_json(inference.health_check(name))
     except KeyError:
         raise HTTPException(404, "inference service not found")
+
+@app.post("/api/v1/inference/services/{name}/route")
+def route_inference(name: str, req: RouteRequest, user=Depends(current_user)):
+    try:
+        inference.get(name)
+        policy = RoutingPolicy(req.policy)
+        for metric in req.replicas:
+            router.update_replica(name, metric.name, queue_depth=metric.queue_depth, kv_cache_utilization=metric.kv_cache_utilization, state=metric.state)
+        return router.choose(name, policy)
+    except KeyError as exc:
+        raise HTTPException(404, f"inference replica not found: {exc.args[0]}")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
 
 @app.post("/api/v1/inference/services/{name}/stop")
 def stop_inference_service(name: str, user=Depends(require_role("operator", "admin"))):
@@ -301,6 +327,8 @@ def metrics():
             f"inference_service_health_failures_total{{{labels}}} {service.health_failures}",
             f'inference_service_info{{{model_labels},state="{prom_escape(service.state.value)}"}} 1',
         ]
+    for (service_name, policy), count in router.decisions.items():
+        lines.append(f'inference_routing_decisions_total{{service="{prom_escape(service_name)}",policy="{prom_escape(policy)}"}} {count}')
     return "\n".join(lines) + "\n"
 
 @app.get("/")
