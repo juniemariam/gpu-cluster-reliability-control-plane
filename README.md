@@ -1,8 +1,25 @@
 # GPU Cluster Reliability Control Plane
 
-An NVIDIA GPU cluster operations platform for safely scheduling research workloads, observing GPU health, detecting failures, and executing automated remediation.
+An NVIDIA GPU cluster operations and LLM inference platform built around a clear separation between the control plane and the data plane.
 
-The project models the control-plane responsibilities that surround machine-learning infrastructure: GPU discovery, workload admission, CUDA execution, telemetry refresh, incident generation, audit history, and AIOps reconciliation.
+The project started as a GPU-cluster reliability system: discover GPUs, admit workloads, observe health, detect failures, and perform controlled remediation. It has since been extended into a working single-GPU inference platform that deploys Qwen through vLLM, exposes OpenAI-compatible chat APIs, streams tokens, and measures inference performance.
+
+The result is a practical portfolio project for GPU infrastructure, Kubernetes, inference serving, and reliability engineering.
+
+## What this project demonstrates
+
+- Real NVIDIA GPU discovery through `nvidia-smi`
+- Simulated multi-node mode for development without a GPU cluster
+- GPU-aware workload admission and priority scheduling
+- CUDA smoke workloads and Kubernetes GPU Jobs
+- GPU health validation and failure injection
+- Evidence-based AIOps remediation with allow-listed actions
+- PostgreSQL-ready workload, incident, and audit persistence
+- Kubernetes custom resources and Lease-based controller leadership
+- Real LLM serving with vLLM on an RTX 5070 Ti
+- OpenAI-compatible chat completions and SSE streaming
+- TTFT, TPOT, tokens/sec, latency, and token accounting
+- Prometheus-compatible metrics and a Grafana inference dashboard
 
 ## Why this project exists
 
@@ -22,30 +39,84 @@ Research teams need reliable access to GPU clusters without manually inspecting 
 
 ## Architecture at a glance
 
-```text
-                         +----------------------+
-                         |  Operator Dashboard  |
-                         |  FastAPI static UI   |
-                         +----------+-----------+
-                                    |
-                                    v
-+----------------+       +----------+-----------+       +----------------+
-| Researcher /  |------>| FastAPI Control Plane |<----->|  PostgreSQL    |
-| Operator API   |       | jobs, health, AIOps   |       | jobs/audit     |
-+----------------+       +----+-------------+---+       +----------------+
-                              |             |
-                              v             v
-                    +---------+--+   +------+----------------+
-                    | GPU Adapter |   | Reliability Controller |
-                    | nvidia-smi  |   | reconcile/remediation  |
-                    +------+------+
-                           |
-                           v
-                    +------+------+
-                    | NVIDIA GPU  |
-                    | RTX 5070 Ti |
-                    +-------------+
+```mermaid
+flowchart TD
+    Users["Operator or inference client"] --> API["FastAPI control plane"]
+    API --> Registry["Inference service registry"]
+    API --> Scheduler["GPU scheduler and workload API"]
+    API --> Reliability["Validator and AIOps remediation"]
+    API --> State[("PostgreSQL and audit state")]
+    Registry --> Runtime["OpenAI-compatible runtime adapter"]
+    Runtime --> vLLM["vLLM inference server"]
+    vLLM --> Model["Qwen model"]
+    Model --> GPU["NVIDIA GPU"]
+    GPU --> Telemetry["nvidia-smi and DCGM telemetry"]
+    Telemetry --> Metrics["Prometheus and Grafana"]
 ```
+
+The platform now manages two related workload paths:
+
+```text
+Batch path:      API → scheduler → CUDA/Kubernetes workload → GPU
+Inference path:  API → service registry → vLLM → model → GPU → streamed tokens
+Reliability:     telemetry → validator → AIOps action → audit state
+```
+
+## Control plane and data plane
+
+The control plane decides what should happen. It handles GPU inventory,
+admission, scheduling, health, remediation, service registration, and metrics.
+
+The data plane performs the work. It includes the CUDA workers and the vLLM
+server that loads the Qwen model and generates tokens on the NVIDIA GPU.
+
+```text
+Client
+  ↓
+FastAPI control plane :8001
+  ├── service registry
+  ├── GPU health and scheduling
+  ├── audit and metrics
+  └── runtime adapter
+          ↓
+    vLLM data plane :8002
+          ↓
+    Qwen model on NVIDIA GPU
+```
+
+This separation lets the project manage inference without embedding model
+execution inside the control-plane process.
+
+## Engineering journey
+
+### GPU reliability foundation
+
+The original platform established the operational foundation: discover GPUs,
+admit workloads by capacity and priority, execute CUDA smoke tests, refresh
+telemetry, detect abnormal conditions, and perform controlled recovery actions.
+
+### Inference service abstraction
+
+Inference was added as a first-class workload boundary. An inference service
+contains a model, runtime, endpoint, replica count, GPU count, lifecycle state,
+request counters, token counters, and recent performance measurements.
+
+The runtime boundary supports a deterministic mock runtime for CPU development
+and an OpenAI-compatible adapter for vLLM, SGLang, TGI, or another compatible
+server.
+
+### Real vLLM serving
+
+The local deployment runs `Qwen/Qwen2.5-1.5B-Instruct` through vLLM in a
+GPU-enabled Docker container. FastAPI routes requests to vLLM and returns either
+a complete OpenAI-compatible response or an SSE stream.
+
+### Performance measurement
+
+The service records time to first token (TTFT), time per output token (TPOT),
+tokens per second, request duration, prompt tokens, completion tokens, request
+count, and error count. These measurements create a baseline for future
+runtime, batching, and multi-GPU comparisons.
 
 ## Runtime modes
 
@@ -90,8 +161,9 @@ The control plane also exposes a first inference-service boundary. Services can
 use the deterministic `mock` runtime for CPU development or an
 `openai-compatible` runtime for vLLM, SGLang, TGI, or another compatible
 server. This milestone supports service registration, lifecycle state,
-non-streaming chat completions, and token/request counters. Streaming,
-continuous batching, and Kubernetes model deployment are next steps.
+ chat completions, SSE streaming, token/request counters, and basic latency/
+ throughput metrics. Continuous batching and Kubernetes model lifecycle
+ management are next steps.
 
 Example local flow:
 
@@ -104,6 +176,103 @@ curl -X POST http://localhost:8000/api/v1/inference/services/rick/chat/completio
   -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+To deploy the first real vLLM backend on Kubernetes, apply the platform,
+database, and inference manifests in the `gpuops` namespace:
+
+```bash
+kubectl apply -f deploy/postgres.yaml
+kubectl apply -f deploy/k8s.yaml
+kubectl apply -f deploy/inference-vllm.yaml
+kubectl -n gpuops rollout status deployment/vllm-inference --timeout=10m
+```
+
+The API deployment receives the internal vLLM endpoint through
+`INFERENCE_ENDPOINT`. Register the service after the vLLM pod is ready:
+
+```bash
+curl -X POST http://127.0.0.1:8003/api/v1/inference/services \
+  -H 'content-type: application/json' \
+  -d '{"name":"qwen","model":"Qwen/Qwen2.5-1.5B-Instruct","runtime":"vllm","gpu_count":1}'
+```
+
+For gated Hugging Face models, create the optional token secret before applying
+the vLLM deployment:
+
+```bash
+kubectl -n gpuops create secret generic huggingface-token \
+  --from-literal=HF_TOKEN="$HF_TOKEN"
+```
+
+The manifest uses `vllm/vllm-openai:latest` for an initial smoke test. Pin a
+tested vLLM image tag and use persistent model storage before production use.
+
+The observability manifest now provisions Prometheus scraping plus a Grafana
+`GPUOps Inference` dashboard for request rate, TTFT, TPOT, tokens/sec, GPU
+utilization, and GPU memory. Apply it after the platform service is available:
+
+```bash
+kubectl apply -f deploy/observability.yaml
+kubectl -n monitoring port-forward service/grafana 3000:3000
+```
+
+Open `http://127.0.0.1:3000` and select the provisioned `GPUOps Inference`
+dashboard.
+
+### Local GPU inference quickstart
+
+On a Windows workstation with Docker Desktop GPU support:
+
+```powershell
+$env:CLUSTER_MODE = "real"
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn app.api:app --host 127.0.0.1 --port 8001
+```
+
+In a second terminal, start vLLM:
+
+```powershell
+docker run --rm `
+  --name vllm-qwen `
+  --gpus all `
+  --ipc=host `
+  -p 8002:8000 `
+  vllm/vllm-openai:latest `
+  --model Qwen/Qwen2.5-1.5B-Instruct `
+  --served-model-name Qwen/Qwen2.5-1.5B-Instruct `
+  --host 0.0.0.0 `
+  --port 8000 `
+  --max-model-len 4096 `
+  --gpu-memory-utilization 0.90
+```
+
+Register the service through `/docs`, then send a request to
+`/api/v1/inference/services/local-qwen/chat/completions`. Use
+`{"stream":true}` to receive server-sent events. View the resulting metrics at
+`/metrics`.
+
+### Observed local result
+
+The first real local inference run produced this smoke-test sample:
+
+| Metric | Observed value |
+|---|---:|
+| GPU | NVIDIA GeForce RTX 5070 Ti |
+| Model | Qwen 2.5 1.5B Instruct |
+| Requests | 2 |
+| Errors | 0 |
+| Prompt tokens | 72 |
+| Completion tokens | 509 |
+| TTFT | 0.318 seconds |
+| TPOT | 0.006 seconds/token |
+| Throughput | 165.55 tokens/sec |
+| Latest request duration | 0.771 seconds |
+| GPU memory observed | 14,488 MB |
+
+These are workstation smoke-test measurements, not production benchmarks. They
+demonstrate that the complete control-plane-to-GPU inference path is working
+and measurable.
 
 ### Persistence and auditability
 
@@ -208,4 +377,45 @@ Interactive API documentation is available at `/docs`.
 
 ## Limitations and production next steps
 
-This is a portfolio-scale control plane, not a replacement for a production scheduler. Durable workload state, idempotent replay protection, a Kubernetes workload CRD, and Lease-based controller leadership are implemented. Remaining production-hardening work includes a real queue, actual model checkpoint save/restore, highly available PostgreSQL, stronger authentication and authorization, structured logs, Prometheus/Grafana dashboards, alert routing, network policies, image signing, and multi-node testing.
+This is a portfolio-scale platform, not a replacement for a production scheduler or managed AI cloud. The project has durable database records, idempotency metadata, a Kubernetes workload CRD, and Lease-based controller leadership. The in-process scheduler and inference registry are intentionally simplified and are not yet fully rehydrated from durable state after a process restart.
+
+### State and control plane
+
+- Persist inference-service definitions and reconcile them into runtime state.
+- Replace the in-memory scheduler with a durable, distributed queue.
+- Add highly available PostgreSQL, migrations, backups, and recovery testing.
+- Implement real checkpoint save/restore and idempotent controller replay.
+
+### Inference serving
+
+- Add model lifecycle reconciliation, readiness state, and rolling updates.
+- Add request backpressure, cancellation, timeouts, rate limits, and admission control.
+- Add continuous batching, KV-cache visibility, prefix caching, and load testing.
+- Add tensor-parallel configuration, topology-aware placement, and multi-GPU benchmarks.
+
+### Platform security and operations
+
+- Enable strong authentication and authorization by default.
+- Replace development credentials with managed secrets.
+- Pin all images and dependencies, sign images, and scan for vulnerabilities.
+- Add authenticated TLS ingress, network policies, structured logs, traces, and alert routing.
+- Define SLOs for availability, TTFT, TPOT, error rate, and throughput.
+
+### Scaling and observability
+
+- Add autoscaling based on queue depth, request rate, GPU utilization, and KV-cache pressure.
+- Replace process-local counters with durable Prometheus histograms and long-term retention.
+- Expand the starter Grafana dashboard with alerts, deployment health, and cost signals.
+
+The current local implementation establishes a measurable single-GPU baseline. A
+future cloud deployment will add tensor-parallel configuration, topology-aware
+placement, and benchmark comparisons across multiple GPUs.
+
+## Why this matters for GPU-cloud infrastructure
+
+The project demonstrates the boundary between GPU infrastructure and model
+serving. GPUs are treated as operational resources, model servers as managed
+workloads, and inference performance as a production signal. That combination
+is the foundation for larger systems built around Kubernetes GPU scheduling,
+high-performance networking, model runtimes, autoscaling, and fleet
+reliability.
