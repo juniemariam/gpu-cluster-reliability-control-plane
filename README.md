@@ -417,6 +417,59 @@ generation. The three replicas are logical replicas on one GPU, so these results
 demonstrate policy behavior and concurrency handling rather than independent
 GPU capacity.
 
+### Single-GPU inference benchmark suite
+
+The next measurement milestone is a reproducible workload benchmark against the
+live control-plane-to-vLLM path. The benchmark varies concurrency and prompt
+length, captures streaming TTFT, TPOT, generated-token throughput, P95 request
+latency, success rate, queue depth, and best-effort GPU/KV-cache telemetry.
+
+Run it after starting the API and registering `local-qwen`:
+
+```powershell
+python -m app.inference_benchmark `
+  --service local-qwen `
+  --concurrency 1,4,8,16 `
+  --prompt-tokens 128,2048 `
+  --requests 16 `
+  --max-tokens 64 `
+  --runtime-metrics-url http://127.0.0.1:8002/metrics `
+  --output benchmark-results.json `
+  --csv benchmark-results.csv
+```
+
+The benchmark was run on the local NVIDIA GeForce RTX 5070 Ti. The measured
+results are:
+
+| Concurrency | Prompt tokens | TTFT | TPOT | Throughput | P95 | GPU util avg/max | KV cache max |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 125 | 0.327 s | 5.43 ms | 94.0 tok/s | 0.705 s | 45.5% / 87% | 0.05% |
+| 4 | 125 | 0.388 s | 5.61 ms | 87.8 tok/s | 0.754 s | 27.5% / 55% | 0.05% |
+| 8 | 125 | 0.553 s | 5.21 ms | 72.6 tok/s | 0.881 s | 0% / 0%* | 0.05% |
+| 16 | 125 | 0.624 s | 5.40 ms | 66.3 tok/s | 0.964 s | 26% / 26%* | 0.04% |
+| 1 | 1,566 | 0.325 s | 5.43 ms | 33.0 tok/s | 0.433 s | 9.5% / 61% | 0.41% |
+| 4 | 1,566 | 0.385 s | 5.48 ms | 26.8 tok/s | 0.482 s | 0% / 0%* | 0% |
+| 8 | 1,566 | 0.420 s | 5.44 ms | 28.7 tok/s | 0.600 s | 23% / 23%* | 0% |
+| 16 | 1,566 | 0.640 s | 5.74 ms | 15.7 tok/s | 0.708 s | 40% / 40%* | 0% |
+
+All 128 requests succeeded. Queue depth remained zero. The requested `2,048`
+token prompt generated `1,566` actual runtime tokens, so the observed token
+count—not the target label—should be used when comparing workloads. KV-cache
+utilization remained below 0.5% for this small model and short `max_tokens=64`
+workload.
+
+The rows marked `*` had only one or two 250-ms telemetry samples because the
+workload completed quickly; their latency and throughput values are usable, but
+their GPU-utilization averages are directional rather than a full time-series
+profile. The benchmark also uses a non-streaming calibration request to obtain
+the authoritative prompt-token count because streamed usage coverage is not
+consistent at higher concurrency.
+
+The benchmark reports the runtime's actual prompt-token count when streamed
+usage is available; the prompt target is only a reproducible workload label.
+Increasing concurrency should be interpreted alongside admission rejections,
+queue depth, KV-cache pressure, and P95 latency—not throughput alone.
+
 ### Persistence and auditability
 
 PostgreSQL stores job, incident, and audit records. This gives the demo an operational history instead of relying only on transient console output.
@@ -539,17 +592,19 @@ demonstrator and a production-oriented inference platform:
 
 1. Deploy independent vLLM replicas and route real requests across them. The
    current router selects logical replicas that share one vLLM backend.
-2. Validate the vLLM metric scrape against the exact runtime version in use and
+2. Run and publish the single-GPU concurrency/prompt-length benchmark above,
+   explaining the transition from compute-bound prefill to memory-bound decode.
+3. Validate the vLLM metric scrape against the exact runtime version in use and
    expand compatibility for metric-name changes across vLLM releases.
-3. Add a background health controller that continuously probes services,
+4. Add a background health controller that continuously probes services,
    persists health transitions, and automatically drains and restores replicas.
-4. Replace the local persistence path with migrations, HA PostgreSQL, backups,
+5. Replace the local persistence path with migrations, HA PostgreSQL, backups,
    and explicit controller recovery tests.
-5. Replace reject-only admission backpressure with a bounded waiting queue,
+6. Replace reject-only admission backpressure with a bounded waiting queue,
    cancellation, timeouts, per-tenant limits, and fair scheduling.
-6. Run end-to-end concurrent benchmarks measuring TTFT, TPOT, throughput, queue
-   depth, error rate, and cost across routing policies.
-7. Add multi-GPU tensor-parallel experiments, topology-aware placement,
+7. Add independent vLLM replicas on separate GPUs and compare round robin,
+   least-loaded, and prefix/KV-cache-aware routing.
+8. Add multi-GPU tensor-parallel experiments, topology-aware placement,
    autoscaling, and eventually high-speed networking/RDMA measurements.
 
 ### State and control plane
