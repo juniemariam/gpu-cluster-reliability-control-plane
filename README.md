@@ -90,9 +90,8 @@ The control plane also exposes a first inference-service boundary. Services can
 use the deterministic `mock` runtime for CPU development or an
 `openai-compatible` runtime for vLLM, SGLang, TGI, or another compatible
 server. This milestone supports service registration, lifecycle state,
- chat completions, SSE streaming, token/request counters, and basic latency/
- throughput metrics. Continuous batching and Kubernetes model lifecycle
- management are next steps.
+non-streaming chat completions, and token/request counters. Streaming,
+continuous batching, and Kubernetes model deployment are next steps.
 
 Example local flow:
 
@@ -105,48 +104,6 @@ curl -X POST http://localhost:8000/api/v1/inference/services/rick/chat/completio
   -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello"}]}'
 ```
-
-To deploy the first real vLLM backend on Kubernetes, apply the platform,
-database, and inference manifests in the `gpuops` namespace:
-
-```bash
-kubectl apply -f deploy/postgres.yaml
-kubectl apply -f deploy/k8s.yaml
-kubectl apply -f deploy/inference-vllm.yaml
-kubectl -n gpuops rollout status deployment/vllm-inference --timeout=10m
-```
-
-The API deployment receives the internal vLLM endpoint through
-`INFERENCE_ENDPOINT`. Register the service after the vLLM pod is ready:
-
-```bash
-curl -X POST http://127.0.0.1:8003/api/v1/inference/services \
-  -H 'content-type: application/json' \
-  -d '{"name":"qwen","model":"Qwen/Qwen2.5-1.5B-Instruct","runtime":"vllm","gpu_count":1}'
-```
-
-For gated Hugging Face models, create the optional token secret before applying
-the vLLM deployment:
-
-```bash
-kubectl -n gpuops create secret generic huggingface-token \
-  --from-literal=HF_TOKEN="$HF_TOKEN"
-```
-
-The manifest uses `vllm/vllm-openai:latest` for an initial smoke test. Pin a
-tested vLLM image tag and use persistent model storage before production use.
-
-The observability manifest now provisions Prometheus scraping plus a Grafana
-`GPUOps Inference` dashboard for request rate, TTFT, TPOT, tokens/sec, GPU
-utilization, and GPU memory. Apply it after the platform service is available:
-
-```bash
-kubectl apply -f deploy/observability.yaml
-kubectl -n monitoring port-forward service/grafana 3000:3000
-```
-
-Open `http://127.0.0.1:3000` and select the provisioned `GPUOps Inference`
-dashboard.
 
 ### Persistence and auditability
 
