@@ -1,4 +1,4 @@
-# GPU Cluster Reliability & Inference Control Plane
+# GPU Cluster Reliability Control Plane
 
 An NVIDIA GPU cluster operations and LLM inference platform built around a clear separation between the control plane and the data plane.
 
@@ -118,20 +118,31 @@ tokens per second, request duration, prompt tokens, completion tokens, request
 count, and error count. These measurements create a baseline for future
 runtime, batching, and multi-GPU comparisons.
 
+### Inference health monitoring
+
+The control plane can actively check an inference backend. For an
+OpenAI-compatible service, the health probe calls the backend `/health`
+endpoint, tracks health-check failures, records in-flight requests and queue
+depth, and marks the service `ready` or `unavailable`. These signals are
+exposed through the service API and Prometheus metrics. The local implementation
+uses one real vLLM backend; multi-replica routing remains future work.
+
 ## Runtime modes
 
 ### Real GPU mode
 
 Used by the native k3s deployment. The application executes `nvidia-smi` to discover the host GPU and refresh memory, utilization, temperature, power, driver, and CUDA information.
 
-The current local environment uses:
+The Kubernetes deployment target uses:
 
-- NVIDIA GeForce RTX 5070 Ti;
 - native k3s inside Ubuntu 24.04 on WSL2;
 - NVIDIA Container Toolkit;
 - NVIDIA Kubernetes device plugin;
 - `runtimeClassName: nvidia`;
 - Kubernetes extended resource `nvidia.com/gpu`.
+
+The measured local inference run used Docker Desktop GPU support on an NVIDIA
+GeForce RTX 5070 Ti.
 
 ### Simulated mode
 
@@ -154,6 +165,31 @@ The dashboard can submit a CUDA job and launch the packaged GPU worker. The work
 ### Reliability and AIOps
 
 Operators can inject GPU-memory pressure. The validator turns abnormal telemetry into incidents with evidence and a recommended action. The AIOps agent reconciles incidents and records remediation actions such as `drain_node_and_clear_workloads`.
+
+### Measured reliability experiment
+
+The repository includes a repeatable CPU-only experiment that models a running
+GPU workload, injects memory pressure, detects the resulting incident, marks
+the node draining, requeues the affected workload, recovers the node, and
+checks healthy control trials for false positives:
+
+```bash
+python -m app.reliability_experiment
+```
+
+The output reports failure-detection latency, drain-initiation latency,
+recovery time, workloads affected, and false-positive rate. These are
+control-plane measurements in the simulated cluster, not claims about physical
+GPU reset or production fleet recovery time. A representative local run is:
+
+```text
+trials: 5
+workloads_affected: 1
+false_positive_rate: 0.0
+```
+
+The exact timing values are machine-dependent and should be captured when the
+experiment is run.
 
 ### Inference service foundation
 
@@ -274,6 +310,28 @@ These are workstation smoke-test measurements, not production benchmarks. They
 demonstrate that the complete control-plane-to-GPU inference path is working
 and measurable.
 
+### Latest local inference-health validation
+
+After restarting the control plane, registering `local-qwen`, probing the vLLM
+health endpoint, and sending a streamed request, the service reported:
+
+| Signal | Observed value |
+|---|---:|
+| Service state | `ready` |
+| Health checks | 1 |
+| Health failures | 0 |
+| Requests | 2 |
+| Request errors | 0 |
+| Queue depth | 0 |
+| TTFT | 0.282 seconds |
+| TPOT | 0.00898 seconds/token |
+| Generated token rate | 111.42 tokens/sec |
+| Latest request duration | 0.623 seconds |
+
+This validates the local health-probe, streaming, and performance-accounting
+path on one RTX 5070 Ti. The numbers are a workstation smoke-test sample, not
+a production SLO or multi-replica benchmark.
+
 ### Persistence and auditability
 
 PostgreSQL stores job, incident, and audit records. This gives the demo an operational history instead of relying only on transient console output.
@@ -283,10 +341,12 @@ PostgreSQL stores job, incident, and audit records. This gives the demo an opera
 ```text
 app/
   api.py                    FastAPI routes and lifecycle
+  inference.py              Inference service registry and runtime adapters
   cluster.py                Real/simulated GPU discovery and telemetry
   scheduler.py              GPU-aware job admission and lifecycle
   agent.py                  Reliability reconciliation logic
   validator.py              Health and incident validation
+  reliability_experiment.py Repeatable failure/recovery benchmark
   persistence.py            PostgreSQL persistence and audit events
   gpu_worker.py             CUDA workload worker
   kubernetes_adapter.py     Kubernetes integration boundary
@@ -308,6 +368,7 @@ deploy/
   controller.yaml            RBAC and reliability controller
   training-job.yaml          Kubernetes GPU training Job
   observability.yaml         Observability resources
+  inference-vllm.yaml        GPU-backed vLLM deployment and service
 ```
 
 ## Run the real GPU Kubernetes demo
@@ -351,7 +412,9 @@ The Compose GPU service is exposed at `http://127.0.0.1:8002`.
 4. Click **Inject GPU pressure**.
 5. Click **Run AIOps reconcile**.
 6. Show the incident evidence and remediation action.
-7. Explain that Kubernetes handles placement and GPU allocation while the application provides the control-plane and reliability workflow.
+7. Register a mock or vLLM inference service and send a chat completion.
+8. Repeat with `stream: true` and inspect TTFT, TPOT, tokens/sec, and GPU metrics.
+9. Explain that Kubernetes handles placement and GPU allocation while the application provides the control-plane and reliability workflow.
 
 ## API surface
 
@@ -368,7 +431,9 @@ The Compose GPU service is exposed at `http://127.0.0.1:8002`.
 | `POST /api/v1/agent/reconcile` | Detect and remediate incidents |
 | `POST /api/v1/inference/services` | Register an inference service |
 | `GET /api/v1/inference/services` | List inference services |
-| `POST /api/v1/inference/services/{name}/chat/completions` | Send a chat completion request |
+| `GET /api/v1/inference/services/{name}` | Inspect service state and performance |
+| `GET /api/v1/inference/services/{name}/health` | Probe backend health and update service state |
+| `POST /api/v1/inference/services/{name}/chat/completions` | Send a chat completion request; supports `stream: true` |
 | `POST /api/v1/inference/services/{name}/stop` | Stop an inference service |
 | `GET /metrics` | Prometheus-compatible metrics |
 

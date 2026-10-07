@@ -21,7 +21,7 @@ BASE_DIR = Path(__file__).parent
 logger = logging.getLogger("gpu-cluster-ops")
 
 app = FastAPI(title="GPU Cluster Operations Platform", version="0.3.0")
-cluster = Cluster(); scheduler = Scheduler(cluster); agent = AIOpsAgent(cluster)
+cluster = Cluster(); scheduler = Scheduler(cluster); agent = AIOpsAgent(cluster, scheduler)
 inference = InferenceManager()
 processes = {}
 
@@ -204,6 +204,13 @@ def get_inference_service(name: str, user=Depends(current_user)):
     except KeyError:
         raise HTTPException(404, "inference service not found")
 
+@app.get("/api/v1/inference/services/{name}/health")
+def inference_health(name: str, user=Depends(current_user)):
+    try:
+        return inference_json(inference.health_check(name))
+    except KeyError:
+        raise HTTPException(404, "inference service not found")
+
 @app.post("/api/v1/inference/services/{name}/stop")
 def stop_inference_service(name: str, user=Depends(require_role("operator", "admin"))):
     try:
@@ -288,6 +295,10 @@ def metrics():
             f"inference_service_last_ttft_seconds{{{labels}}} {service.last_ttft_seconds}",
             f"inference_service_last_tpot_seconds{{{labels}}} {service.last_tpot_seconds}",
             f"inference_service_last_tokens_per_second{{{labels}}} {service.last_tokens_per_second}",
+            f"inference_service_queue_depth{{{labels}}} {service.queue_depth}",
+            f"inference_service_in_flight_requests{{{labels}}} {service.in_flight_requests}",
+            f"inference_service_health_checks_total{{{labels}}} {service.health_checks}",
+            f"inference_service_health_failures_total{{{labels}}} {service.health_failures}",
             f'inference_service_info{{{model_labels},state="{prom_escape(service.state.value)}"}} 1',
         ]
     return "\n".join(lines) + "\n"

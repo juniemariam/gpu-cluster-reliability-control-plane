@@ -19,6 +19,7 @@ def utc_now() -> datetime:
 class InferenceServiceState(str, Enum):
     READY = "ready"
     DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
     STOPPED = "stopped"
 
 
@@ -42,15 +43,27 @@ class InferenceService:
     last_ttft_seconds: float = 0.0
     last_tpot_seconds: float = 0.0
     last_tokens_per_second: float = 0.0
+    queue_depth: int = 0
+    in_flight_requests: int = 0
+    health_checks: int = 0
+    health_failures: int = 0
+    last_health_check_at: datetime | None = None
+    last_health_error: str | None = None
 
 
 class InferenceRuntime:
     def chat(self, service: InferenceService, payload: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
         raise NotImplementedError
 
+    def health(self, service: InferenceService) -> tuple[bool, str | None]:
+        return True, None
+
 
 class MockRuntime(InferenceRuntime):
     """Deterministic runtime for CPU development and API tests."""
+
+    def health(self, service: InferenceService):
+        return True, None
 
     def chat(self, service: InferenceService, payload: dict[str, Any]):
         messages = payload.get("messages") or []
@@ -96,6 +109,22 @@ class MockRuntime(InferenceRuntime):
 
 class OpenAICompatibleRuntime(InferenceRuntime):
     """Adapter for vLLM, SGLang, TGI-compatible gateways, or another server."""
+
+    def health(self, service: InferenceService):
+        if not service.endpoint:
+            return False, "endpoint is required for an OpenAI-compatible runtime"
+        try:
+            import httpx
+        except ImportError as exc:
+            return False, type(exc).__name__
+        endpoint = service.endpoint.rstrip("/")
+        base = endpoint[:-3].rstrip("/") if endpoint.endswith("/v1") else endpoint
+        try:
+            response = httpx.get(base + "/health", timeout=5, trust_env=False)
+            response.raise_for_status()
+            return True, None
+        except Exception as exc:
+            return False, type(exc).__name__
 
     def chat(self, service: InferenceService, payload: dict[str, Any]):
         if not service.endpoint:
@@ -162,6 +191,30 @@ class InferenceManager:
             raise KeyError(name)
         return self.services[name]
 
+    def set_queue_depth(self, name: str, depth: int) -> InferenceService:
+        service = self.get(name)
+        if depth < 0:
+            raise ValueError("queue depth must be non-negative")
+        service.queue_depth = depth
+        service.updated_at = utc_now()
+        return service
+
+    def health_check(self, name: str) -> InferenceService:
+        service = self.get(name)
+        if service.state == InferenceServiceState.STOPPED:
+            return service
+        service.health_checks += 1
+        service.last_health_check_at = utc_now()
+        healthy, error = self.runtimes[name].health(service)
+        service.last_health_error = error
+        if healthy:
+            service.state = InferenceServiceState.READY
+        else:
+            service.health_failures += 1
+            service.state = InferenceServiceState.UNAVAILABLE
+        service.updated_at = utc_now()
+        return service
+
     def chat(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         service = self.get(name)
         if service.state == InferenceServiceState.STOPPED:
@@ -169,6 +222,7 @@ class InferenceManager:
         started = time.perf_counter()
         self.request_count += 1
         service.requests += 1
+        service.in_flight_requests += 1
         try:
             response, prompt_tokens, completion_tokens = self.runtimes[name].chat(service, payload)
             service.prompt_tokens += prompt_tokens
@@ -183,6 +237,7 @@ class InferenceManager:
             service.last_error = type(exc).__name__
             raise
         finally:
+            service.in_flight_requests = max(service.in_flight_requests - 1, 0)
             self.total_duration_seconds += time.perf_counter() - started
             service.updated_at = utc_now()
 
@@ -196,6 +251,7 @@ class InferenceManager:
         prompt_tokens = 0
         self.request_count += 1
         service.requests += 1
+        service.in_flight_requests += 1
         try:
             for chunk in self.runtimes[name].stream(service, payload):
                 choices = chunk.get("choices") or []
@@ -219,6 +275,7 @@ class InferenceManager:
             service.last_error = type(exc).__name__
             yield f"event: error\ndata: {json.dumps({'error': type(exc).__name__})}\n\n"
         finally:
+            service.in_flight_requests = max(service.in_flight_requests - 1, 0)
             finished = time.perf_counter()
             duration = finished - started
             ttft = (first_token_at - started) if first_token_at is not None else duration

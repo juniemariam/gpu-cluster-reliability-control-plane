@@ -5,6 +5,7 @@ from app.models import Job, JobState
 from app.scheduler import Scheduler
 from app.validator import Validator
 from app.inference import InferenceManager, InferenceService
+from app.reliability_experiment import run_reliability_experiment
 
 class PlatformTests(unittest.TestCase):
     def setUp(self): self.cluster = Cluster("simulated")
@@ -35,6 +36,33 @@ class PlatformTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             manager.register(InferenceService("demo", "model"))
 
+    def test_mock_inference_health_check_and_queue_depth(self):
+        manager = InferenceManager()
+        manager.register(InferenceService("health", "demo-model"))
+
+        manager.set_queue_depth("health", 3)
+        service = manager.health_check("health")
+
+        self.assertEqual(service.state.value, "ready")
+        self.assertEqual(service.queue_depth, 3)
+        self.assertEqual(service.health_checks, 1)
+        self.assertEqual(service.health_failures, 0)
+
+    def test_failed_inference_health_check_marks_service_unavailable(self):
+        manager = InferenceManager()
+        manager.register(InferenceService("down", "demo-model"))
+
+        class BrokenRuntime:
+            def health(self, service):
+                return False, "ConnectError"
+
+        manager.runtimes["down"] = BrokenRuntime()
+        service = manager.health_check("down")
+
+        self.assertEqual(service.state.value, "unavailable")
+        self.assertEqual(service.health_failures, 1)
+        self.assertEqual(service.last_health_error, "ConnectError")
+
     def test_openai_runtime_requires_endpoint_at_request_time(self):
         manager = InferenceManager()
         manager.register(InferenceService("vllm", "model", runtime="vllm"))
@@ -52,5 +80,14 @@ class PlatformTests(unittest.TestCase):
         self.assertGreater(service.completion_tokens, 0)
         self.assertGreaterEqual(service.last_ttft_seconds, 0)
         self.assertGreaterEqual(service.last_tokens_per_second, 0)
+
+    def test_reliability_experiment_measures_recovery_and_no_false_positives(self):
+        result = run_reliability_experiment(trials=3)
+        self.assertEqual(result.trials, 3)
+        self.assertGreaterEqual(result.failure_detection_seconds, 0)
+        self.assertGreaterEqual(result.drain_initiation_seconds, 0)
+        self.assertGreaterEqual(result.recovery_seconds, 0)
+        self.assertEqual(result.workloads_affected, 1)
+        self.assertEqual(result.false_positive_rate, 0)
 
 if __name__ == "__main__": unittest.main()
