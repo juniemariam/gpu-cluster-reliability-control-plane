@@ -1,4 +1,4 @@
-# GPU Cluster Reliability Control Plane
+# GPU Cluster Reliability & Inference Control Plane
 
 An NVIDIA GPU cluster operations and LLM inference platform built around a clear separation between the control plane and the data plane.
 
