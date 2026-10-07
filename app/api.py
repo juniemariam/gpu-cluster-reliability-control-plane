@@ -7,11 +7,11 @@ from .models import Job
 from .scheduler import Scheduler
 from .validator import Validator
 from .auth import USERS, issue_token, current_user, require_role
-from .persistence import init_db, record_audit, record_job, record_incident, update_job_state, find_job_by_idempotency_key, record_checkpoint, SessionLocal, AuditEvent
+from .persistence import init_db, record_audit, record_job, record_incident, update_job_state, find_job_by_idempotency_key, record_checkpoint, save_inference_service, load_inference_services, load_inference_replicas, SessionLocal, AuditEvent
 from .llm_agent import AgenticPlanner
 from .slurm import SlurmScheduler
 from .kubernetes_adapter import KubernetesAdapter
-from .inference import InferenceManager, InferenceService, default_endpoint
+from .inference import InferenceManager, InferenceService, InferenceServiceState, default_endpoint
 from .routing import InferenceRouter, RoutingPolicy
 from pathlib import Path
 import subprocess
@@ -30,6 +30,18 @@ processes = {}
 @app.on_event("startup")
 def startup():
     init_db()
+    for record in load_inference_services():
+        try:
+            service = inference.register(InferenceService(record.name, record.model, record.runtime, record.endpoint, record.replicas, record.gpu_count))
+            service.state = InferenceServiceState(record.state)
+            service.queue_depth = record.queue_depth
+            service.kv_cache_utilization = record.kv_cache_utilization
+            router.register(service.name, service.replicas)
+            for replica_record in load_inference_replicas(service.name):
+                replica = router.update_replica(service.name, replica_record.name, queue_depth=replica_record.queue_depth, kv_cache_utilization=replica_record.kv_cache_utilization, state=replica_record.state)
+                replica.requests = replica_record.requests
+        except ValueError:
+            continue
 
 def node_json(node):
     return {
@@ -60,12 +72,14 @@ class InferenceServiceRequest(BaseModel):
     endpoint: str | None = None
     replicas: int = Field(default=1, ge=1, le=100)
     gpu_count: int = Field(default=1, ge=1, le=16)
+    max_concurrent_requests: int = Field(default=1, ge=1, le=100)
 class ChatCompletionRequest(BaseModel):
     messages: list[dict]
     model: str | None = None
     temperature: float = Field(default=0.0, ge=0, le=2)
     max_tokens: int | None = Field(default=None, ge=1, le=32768)
     stream: bool = False
+    routing_policy: str = "round-robin"
 class ReplicaMetric(BaseModel):
     name: str
     queue_depth: int = Field(default=0, ge=0)
@@ -197,11 +211,12 @@ def kubernetes_jobs(user=Depends(current_user)): return KubernetesAdapter().list
 @app.post("/api/v1/inference/services")
 def create_inference_service(req: InferenceServiceRequest, user=Depends(require_role("researcher", "operator", "admin"))):
     try:
-        service = inference.register(InferenceService(req.name, req.model, req.runtime, req.endpoint or default_endpoint(), req.replicas, req.gpu_count))
+        service = inference.register(InferenceService(req.name, req.model, req.runtime, req.endpoint or default_endpoint(), req.replicas, req.gpu_count, max_concurrent_requests=req.max_concurrent_requests))
         router.register(service.name, service.replicas)
     except ValueError as exc:
         raise HTTPException(409 if "already exists" in str(exc) else 400, str(exc))
     record_audit(user["sub"], "inference.service_created", service.name, {"model": service.model, "runtime": service.runtime, "gpu_count": service.gpu_count})
+    save_inference_service(service, router.replicas.get(service.name))
     return inference_json(service)
 
 @app.get("/api/v1/inference/services")
@@ -218,18 +233,24 @@ def get_inference_service(name: str, user=Depends(current_user)):
 @app.get("/api/v1/inference/services/{name}/health")
 def inference_health(name: str, user=Depends(current_user)):
     try:
-        return inference_json(inference.health_check(name))
+        service = inference.health_check(name)
+        router.set_service_state(name, service.state.value)
+        save_inference_service(service, router.replicas.get(service.name))
+        return inference_json(service)
     except KeyError:
         raise HTTPException(404, "inference service not found")
 
 @app.post("/api/v1/inference/services/{name}/route")
 def route_inference(name: str, req: RouteRequest, user=Depends(current_user)):
     try:
-        inference.get(name)
+        service = inference.get(name)
+        router.set_service_state(name, service.state.value)
         policy = RoutingPolicy(req.policy)
         for metric in req.replicas:
             router.update_replica(name, metric.name, queue_depth=metric.queue_depth, kv_cache_utilization=metric.kv_cache_utilization, state=metric.state)
-        return router.choose(name, policy)
+        decision = router.choose(name, policy)
+        save_inference_service(service, router.replicas.get(name))
+        return decision
     except KeyError as exc:
         raise HTTPException(404, f"inference replica not found: {exc.args[0]}")
     except ValueError as exc:
@@ -244,29 +265,54 @@ def stop_inference_service(name: str, user=Depends(require_role("operator", "adm
     except KeyError:
         raise HTTPException(404, "inference service not found")
     record_audit(user["sub"], "inference.service_stopped", name)
+    save_inference_service(service, router.replicas.get(name))
     return inference_json(service)
 
 @app.post("/api/v1/inference/services/{name}/chat/completions")
 def chat_completion(name: str, req: ChatCompletionRequest, user=Depends(current_user)):
+    try:
+        service = inference.get(name)
+        router.set_service_state(name, service.state.value)
+        if service.state.value != "ready":
+            raise HTTPException(503, f"inference service is {service.state.value}")
+        decision = router.choose(name, req.routing_policy)
+    except KeyError:
+        raise HTTPException(404, "inference service not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+    routing_headers = {
+        "X-Inference-Replica": decision["replica"],
+        "X-Routing-Policy": decision["policy"],
+    }
+    payload = req.model_dump(exclude_none=True)
+    payload.pop("routing_policy", None)
     if req.stream:
         try:
             inference.get(name)
         except KeyError:
             raise HTTPException(404, "inference service not found")
         return StreamingResponse(
-            inference.stream_chat(name, req.model_dump(exclude_none=True)),
+            inference.stream_chat(name, payload),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", **routing_headers},
         )
     try:
-        response = inference.chat(name, req.model_dump(exclude_none=True))
+        response = inference.chat(name, payload)
     except KeyError:
         raise HTTPException(404, "inference service not found")
     except RuntimeError as exc:
-        raise HTTPException(409, str(exc))
+        raise HTTPException(429 if "admission limit" in str(exc) else 409, str(exc))
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("inference_request_failed service=%s", name)
+        service = inference.get(name)
+        router.set_service_state(name, service.state.value)
+        save_inference_service(service, router.replicas.get(name))
         raise HTTPException(502, f"inference runtime failed: {type(exc).__name__}")
+    response["routing"] = decision
     return response
 
 @app.get("/api/v1/audit")
@@ -279,6 +325,18 @@ def audit(user=Depends(require_role("admin"))):
 def metrics():
     cluster.refresh_telemetry()
     refresh_processes()
+    for service in inference.services.values():
+        inference.refresh_metrics(service.name)
+        try:
+            router.update_replica(
+                service.name,
+                f"{service.name}-replica-0",
+                queue_depth=service.queue_depth,
+                kv_cache_utilization=service.kv_cache_utilization,
+                state="ready" if service.state.value == "ready" else "unavailable",
+            )
+        except (KeyError, ValueError):
+            pass
     lines = ["# HELP cluster_nodes_total Number of cluster nodes", "# TYPE cluster_nodes_total gauge", f"cluster_nodes_total {len(cluster.nodes)}"]
     for n in cluster.nodes.values():
         for g in n.gpus:
@@ -325,6 +383,7 @@ def metrics():
             f"inference_service_in_flight_requests{{{labels}}} {service.in_flight_requests}",
             f"inference_service_health_checks_total{{{labels}}} {service.health_checks}",
             f"inference_service_health_failures_total{{{labels}}} {service.health_failures}",
+            f"inference_service_admission_rejections_total{{{labels}}} {service.admission_rejections}",
             f'inference_service_info{{{model_labels},state="{prom_escape(service.state.value)}"}} 1',
         ]
     for (service_name, policy), count in router.decisions.items():

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from enum import Enum
 import json
 import os
+import re
+import threading
 import time
 from typing import Any
 
@@ -49,6 +51,11 @@ class InferenceService:
     health_failures: int = 0
     last_health_check_at: datetime | None = None
     last_health_error: str | None = None
+    kv_cache_utilization: float = 0.0
+    runtime_metrics_at: datetime | None = None
+    runtime_metrics_error: str | None = None
+    max_concurrent_requests: int = 1
+    admission_rejections: int = 0
 
 
 class InferenceRuntime:
@@ -58,12 +65,18 @@ class InferenceRuntime:
     def health(self, service: InferenceService) -> tuple[bool, str | None]:
         return True, None
 
+    def metrics(self, service: InferenceService) -> dict[str, float]:
+        return {"queue_depth": float(service.queue_depth), "kv_cache_utilization": service.kv_cache_utilization}
+
 
 class MockRuntime(InferenceRuntime):
     """Deterministic runtime for CPU development and API tests."""
 
     def health(self, service: InferenceService):
         return True, None
+
+    def metrics(self, service: InferenceService):
+        return {"queue_depth": float(service.queue_depth), "kv_cache_utilization": service.kv_cache_utilization}
 
     def chat(self, service: InferenceService, payload: dict[str, Any]):
         messages = payload.get("messages") or []
@@ -117,6 +130,32 @@ class OpenAICompatibleRuntime(InferenceRuntime):
             import httpx
         except ImportError as exc:
             return False, type(exc).__name__
+
+    @staticmethod
+    def parse_metrics_text(text: str) -> dict[str, float]:
+        def read(pattern):
+            match = re.search(pattern, text)
+            return float(match.group(1)) if match else None
+
+        waiting = read(r"vllm:num_requests_waiting(?:\{[^}]*\})?\s+([0-9.eE+-]+)")
+        cache = read(r"vllm:(?:kv_cache_usage_perc|gpu_cache_usage_perc)(?:\{[^}]*\})?\s+([0-9.eE+-]+)")
+        return {
+            "queue_depth": waiting if waiting is not None else 0.0,
+            "kv_cache_utilization": (cache / 100.0 if cache is not None and cache > 1 else cache) if cache is not None else 0.0,
+        }
+
+    def metrics(self, service: InferenceService):
+        if not service.endpoint:
+            raise ValueError("endpoint is required for an OpenAI-compatible runtime")
+        try:
+            import httpx
+        except ImportError as exc:
+            raise RuntimeError("httpx is required for an OpenAI-compatible runtime") from exc
+        endpoint = service.endpoint.rstrip("/")
+        base = endpoint[:-3].rstrip("/") if endpoint.endswith("/v1") else endpoint
+        response = httpx.get(base + "/metrics", timeout=5, trust_env=False)
+        response.raise_for_status()
+        return self.parse_metrics_text(response.text)
         endpoint = service.endpoint.rstrip("/")
         base = endpoint[:-3].rstrip("/") if endpoint.endswith("/v1") else endpoint
         try:
@@ -169,6 +208,19 @@ class InferenceManager:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_duration_seconds = 0.0
+        self.auto_drain_error_threshold = 3
+        self._admission_lock = threading.Lock()
+
+    def _acquire_request(self, service: InferenceService):
+        with self._admission_lock:
+            if service.in_flight_requests >= service.max_concurrent_requests:
+                service.admission_rejections += 1
+                raise RuntimeError("inference admission limit exceeded")
+            service.in_flight_requests += 1
+
+    def _release_request(self, service: InferenceService):
+        with self._admission_lock:
+            service.in_flight_requests = max(service.in_flight_requests - 1, 0)
 
     def register(self, service: InferenceService) -> InferenceService:
         if service.name in self.services:
@@ -215,6 +267,19 @@ class InferenceManager:
         service.updated_at = utc_now()
         return service
 
+    def refresh_metrics(self, name: str) -> InferenceService:
+        service = self.get(name)
+        try:
+            values = self.runtimes[name].metrics(service)
+            service.queue_depth = int(values.get("queue_depth", service.queue_depth))
+            service.kv_cache_utilization = float(values.get("kv_cache_utilization", service.kv_cache_utilization))
+            service.runtime_metrics_error = None
+        except Exception as exc:
+            service.runtime_metrics_error = type(exc).__name__
+        service.runtime_metrics_at = utc_now()
+        service.updated_at = utc_now()
+        return service
+
     def chat(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         service = self.get(name)
         if service.state == InferenceServiceState.STOPPED:
@@ -222,7 +287,7 @@ class InferenceManager:
         started = time.perf_counter()
         self.request_count += 1
         service.requests += 1
-        service.in_flight_requests += 1
+        self._acquire_request(service)
         try:
             response, prompt_tokens, completion_tokens = self.runtimes[name].chat(service, payload)
             service.prompt_tokens += prompt_tokens
@@ -235,9 +300,11 @@ class InferenceManager:
             service.errors += 1
             service.state = InferenceServiceState.DEGRADED
             service.last_error = type(exc).__name__
+            if service.errors >= self.auto_drain_error_threshold:
+                service.state = InferenceServiceState.STOPPED
             raise
         finally:
-            service.in_flight_requests = max(service.in_flight_requests - 1, 0)
+            self._release_request(service)
             self.total_duration_seconds += time.perf_counter() - started
             service.updated_at = utc_now()
 
@@ -251,7 +318,11 @@ class InferenceManager:
         prompt_tokens = 0
         self.request_count += 1
         service.requests += 1
-        service.in_flight_requests += 1
+        try:
+            self._acquire_request(service)
+        except RuntimeError as exc:
+            yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+            return
         try:
             for chunk in self.runtimes[name].stream(service, payload):
                 choices = chunk.get("choices") or []
@@ -273,9 +344,11 @@ class InferenceManager:
             service.errors += 1
             service.state = InferenceServiceState.DEGRADED
             service.last_error = type(exc).__name__
+            if service.errors >= self.auto_drain_error_threshold:
+                service.state = InferenceServiceState.STOPPED
             yield f"event: error\ndata: {json.dumps({'error': type(exc).__name__})}\n\n"
         finally:
-            service.in_flight_requests = max(service.in_flight_requests - 1, 0)
+            self._release_request(service)
             finished = time.perf_counter()
             duration = finished - started
             ttft = (first_token_at - started) if first_token_at is not None else duration

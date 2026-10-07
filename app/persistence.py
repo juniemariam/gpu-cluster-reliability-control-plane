@@ -39,6 +39,29 @@ class WorkloadStateRecord(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
+class InferenceServiceRecord(Base):
+    __tablename__ = "inference_services"
+    name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    model: Mapped[str] = mapped_column(String(300))
+    runtime: Mapped[str] = mapped_column(String(50))
+    endpoint: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    replicas: Mapped[int] = mapped_column(Integer, default=1)
+    gpu_count: Mapped[int] = mapped_column(Integer, default=1)
+    state: Mapped[str] = mapped_column(String(30), default="ready", index=True)
+    queue_depth: Mapped[int] = mapped_column(Integer, default=0)
+    kv_cache_utilization: Mapped[float] = mapped_column(default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class InferenceReplicaRecord(Base):
+    __tablename__ = "inference_replicas"
+    name: Mapped[str] = mapped_column(String(150), primary_key=True)
+    service_name: Mapped[str] = mapped_column(String(100), index=True)
+    queue_depth: Mapped[int] = mapped_column(Integer, default=0)
+    kv_cache_utilization: Mapped[float] = mapped_column(default=0.0)
+    state: Mapped[str] = mapped_column(String(30), default="ready")
+    requests: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
 class IncidentRecord(Base):
     __tablename__ = "incidents"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -80,6 +103,39 @@ def update_job_state(job, actor="system", action="job.state_changed"):
         db.merge(JobRecord(id=job.id, name=job.name, state=job.state.value, node_id=job.node_id, gpu_count=job.gpu_count, owner=actor, created_at=job.created_at))
         db.merge(WorkloadStateRecord(job_id=job.id, idempotency_key=job.idempotency_key, state=job.state.value, node_id=job.node_id, gpu_count=job.gpu_count, priority=job.priority, attempt=job.retries, max_retries=job.max_retries, checkpoint_uri=job.checkpoint_uri, checkpoint_step=job.checkpoint_step, error=job.error, updated_at=job.updated_at))
         db.add(AuditEvent(actor=actor, action=action, resource=job.id, details=json.dumps({"state": job.state.value, "attempt": job.retries, "checkpoint_step": job.checkpoint_step})))
+
+def save_inference_service(service, replicas=None):
+    with SessionLocal.begin() as db:
+        db.merge(InferenceServiceRecord(
+            name=service.name,
+            model=service.model,
+            runtime=service.runtime,
+            endpoint=service.endpoint,
+            replicas=service.replicas,
+            gpu_count=service.gpu_count,
+            state=service.state.value,
+            queue_depth=service.queue_depth,
+            kv_cache_utilization=service.kv_cache_utilization,
+            updated_at=service.updated_at,
+        ))
+        for replica in replicas or []:
+            db.merge(InferenceReplicaRecord(
+                name=replica.name,
+                service_name=service.name,
+                queue_depth=replica.queue_depth,
+                kv_cache_utilization=replica.kv_cache_utilization,
+                state=replica.state,
+                requests=replica.requests,
+                updated_at=service.updated_at,
+            ))
+
+def load_inference_services():
+    with SessionLocal() as db:
+        return list(db.scalars(select(InferenceServiceRecord)).all())
+
+def load_inference_replicas(service_name):
+    with SessionLocal() as db:
+        return list(db.scalars(select(InferenceReplicaRecord).where(InferenceReplicaRecord.service_name == service_name)).all())
 
 def record_checkpoint(job, uri, step, actor="system"):
     job.checkpoint_uri = uri

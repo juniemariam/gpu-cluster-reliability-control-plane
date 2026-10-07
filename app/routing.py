@@ -57,6 +57,13 @@ class InferenceRouter:
         replica.state = state
         return replica
 
+    def set_service_state(self, service_name: str, state: str):
+        if service_name not in self.replicas:
+            raise KeyError(service_name)
+        replica_state = "ready" if state == "ready" else "unavailable"
+        for replica in self.replicas[service_name]:
+            replica.state = replica_state
+
     def choose(self, service_name: str, policy: RoutingPolicy | str = RoutingPolicy.ROUND_ROBIN) -> dict:
         if service_name not in self.replicas:
             raise KeyError(service_name)

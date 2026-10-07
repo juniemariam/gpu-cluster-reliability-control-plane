@@ -105,6 +105,12 @@ The runtime boundary supports a deterministic mock runtime for CPU development
 and an OpenAI-compatible adapter for vLLM, SGLang, TGI, or another compatible
 server.
 
+Chat requests now make a routing decision before invoking the selected service
+runtime. The selected logical replica and policy are returned in response
+metadata and headers. With one real GPU, all logical replicas may still point
+to the same vLLM backend; the decision path is real while fleet capacity is
+simulated.
+
 ### Real vLLM serving
 
 The local deployment runs `Qwen/Qwen2.5-1.5B-Instruct` through vLLM in a
@@ -125,7 +131,8 @@ OpenAI-compatible service, the health probe calls the backend `/health`
 endpoint, tracks health-check failures, records in-flight requests and queue
 depth, and marks the service `ready` or `unavailable`. These signals are
 exposed through the service API and Prometheus metrics. The local implementation
-uses one real vLLM backend; multi-replica routing remains future work.
+uses one real vLLM backend; independent multi-process replica deployment remains
+future work.
 
 ### Inference routing policies
 
@@ -140,6 +147,39 @@ On the local workstation these are logical replicas used to evaluate routing
 behavior. They do not imply that three independent vLLM processes are running
 on one GPU. The routing API returns the policy, selected replica, decision
 reason, queue depth, and KV-cache signal used by the decision.
+
+The repository also includes a concurrent routing benchmark:
+
+```bash
+python -m app.routing_benchmark
+```
+
+The benchmark compares decision throughput and replica distribution for all
+three policies. It measures the router, not model-generation throughput.
+
+### Persistence, draining, and admission control
+
+Inference service definitions and routing signals are persisted in the local
+SQLite/PostgreSQL-compatible database and rehydrated when the API starts. A
+failed health check removes a service's logical replicas from routing. Repeated
+runtime failures automatically stop the service after the configured threshold.
+Inference requests also have a bounded concurrency admission limit; requests
+that exceed it receive backpressure instead of being sent blindly to the
+runtime.
+
+The current V2 control-plane path is:
+
+```text
+request → routing policy → selected logical replica → vLLM runtime
+        → TTFT/TPOT/tokens/sec + vLLM queue/KV-cache metrics
+        → health decision → route away or drain after repeated failures
+```
+
+The implementation also includes service/replica state rehydration from the
+database, a concurrent routing-policy benchmark, and bounded request
+admission with HTTP backpressure. On one GPU, logical replicas share the same
+real vLLM backend; distributed capacity and independent model processes remain
+simulation boundaries.
 
 ## Runtime modes
 
@@ -346,6 +386,37 @@ This validates the local health-probe, streaming, and performance-accounting
 path on one RTX 5070 Ti. The numbers are a workstation smoke-test sample, not
 a production SLO or multi-replica benchmark.
 
+### V2 implementation results
+
+The V2 control-plane extensions were validated locally with the following
+checks:
+
+- **18 automated tests passed** across scheduling, failure recovery, inference
+  health, streaming, routing, vLLM metric parsing, draining, persistence
+  behavior, admission limits, and the reliability experiment.
+- **Reliability experiment:** 5 trials, 5 healthy control trials, 1 workload
+  affected, and 0% false positives. Detection, drain initiation, and recovery
+  were all measured in the simulated control-plane path; these microsecond-scale
+  values are not production recovery SLOs.
+- **Persistence:** service definitions and logical replica state were reloaded
+  after an API restart using the local database-backed persistence path.
+- **Routing:** the real chat path makes a routing decision before sending the
+  request to the model runtime. Routing decisions expose the selected replica,
+  policy, queue depth, KV-cache signal, and execution mode.
+
+The concurrent logical-router benchmark ran 100 decisions with 8 workers:
+
+| Policy | Duration | Decisions/sec | Distribution |
+|---|---:|---:|---|
+| Round robin | 0.002408 s | 41,524.79 | 34 / 33 / 33 |
+| Load aware | 0.001632 s | 61,270.76 | 100% replica-1 |
+| KV-cache aware | 0.002099 s | 47,637.20 | 100% replica-1 |
+
+The benchmark measures routing-control-plane decisions, not end-to-end model
+generation. The three replicas are logical replicas on one GPU, so these results
+demonstrate policy behavior and concurrency handling rather than independent
+GPU capacity.
+
 ### Persistence and auditability
 
 PostgreSQL stores job, incident, and audit records. This gives the demo an operational history instead of relying only on transient console output.
@@ -357,6 +428,7 @@ app/
   api.py                    FastAPI routes and lifecycle
   inference.py              Inference service registry and runtime adapters
   routing.py                Round-robin, load-aware, and KV-cache-aware routing
+  routing_benchmark.py       Concurrent routing-policy benchmark
   cluster.py                Real/simulated GPU discovery and telemetry
   scheduler.py              GPU-aware job admission and lifecycle
   agent.py                  Reliability reconciliation logic
@@ -458,11 +530,30 @@ Interactive API documentation is available at `/docs`.
 
 ## Limitations and production next steps
 
-This is a portfolio-scale platform, not a replacement for a production scheduler or managed AI cloud. The project has durable database records, idempotency metadata, a Kubernetes workload CRD, and Lease-based controller leadership. The in-process scheduler and inference registry are intentionally simplified and are not yet fully rehydrated from durable state after a process restart.
+This is a portfolio-scale platform, not a replacement for a production scheduler or managed AI cloud. The project has durable database records, idempotency metadata, a Kubernetes workload CRD, and Lease-based controller leadership. The in-process scheduler and runtime execution are intentionally simplified, while inference-service and logical-replica definitions now rehydrate from durable state.
+
+### Next iteration: pending work
+
+The next iteration should close the gap between a single-GPU control-plane
+demonstrator and a production-oriented inference platform:
+
+1. Deploy independent vLLM replicas and route real requests across them. The
+   current router selects logical replicas that share one vLLM backend.
+2. Validate the vLLM metric scrape against the exact runtime version in use and
+   expand compatibility for metric-name changes across vLLM releases.
+3. Add a background health controller that continuously probes services,
+   persists health transitions, and automatically drains and restores replicas.
+4. Replace the local persistence path with migrations, HA PostgreSQL, backups,
+   and explicit controller recovery tests.
+5. Replace reject-only admission backpressure with a bounded waiting queue,
+   cancellation, timeouts, per-tenant limits, and fair scheduling.
+6. Run end-to-end concurrent benchmarks measuring TTFT, TPOT, throughput, queue
+   depth, error rate, and cost across routing policies.
+7. Add multi-GPU tensor-parallel experiments, topology-aware placement,
+   autoscaling, and eventually high-speed networking/RDMA measurements.
 
 ### State and control plane
 
-- Persist inference-service definitions and reconcile them into runtime state.
 - Replace the in-memory scheduler with a durable, distributed queue.
 - Add highly available PostgreSQL, migrations, backups, and recovery testing.
 - Implement real checkpoint save/restore and idempotent controller replay.
@@ -470,7 +561,8 @@ This is a portfolio-scale platform, not a replacement for a production scheduler
 ### Inference serving
 
 - Add model lifecycle reconciliation, readiness state, and rolling updates.
-- Add request backpressure, cancellation, timeouts, rate limits, and admission control.
+- Extend bounded admission control with a real waiting queue, cancellation,
+  timeouts, and per-tenant rate limits.
 - Add continuous batching, KV-cache visibility, prefix caching, and load testing.
 - Add tensor-parallel configuration, topology-aware placement, and multi-GPU benchmarks.
 
