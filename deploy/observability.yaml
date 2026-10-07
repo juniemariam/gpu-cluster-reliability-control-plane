@@ -77,6 +77,15 @@ spec:
         - name: grafana
           image: grafana/grafana:11.3.0
           ports: [{containerPort: 3000}]
+          volumeMounts:
+            - {name: dashboards, mountPath: /var/lib/grafana/dashboards}
+            - {name: provisioning, mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml, subPath: dashboards.yaml}
+            - {name: provisioning, mountPath: /etc/grafana/provisioning/datasources/datasources.yaml, subPath: datasources.yaml}
+      volumes:
+        - name: dashboards
+          configMap: {name: grafana-dashboards}
+        - name: provisioning
+          configMap: {name: grafana-provisioning}
 ---
 apiVersion: v1
 kind: Service
@@ -84,3 +93,54 @@ metadata: {name: grafana, namespace: monitoring}
 spec:
   selector: {app: grafana}
   ports: [{port: 3000, targetPort: 3000}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-provisioning, namespace: monitoring}
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: gpuops
+        orgId: 1
+        folder: GPU Operations
+        type: file
+        disableDeletion: true
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.monitoring.svc.cluster.local:9090
+        isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-dashboards, namespace: monitoring}
+data:
+  inference.json: |
+    {
+      "annotations": {"list": []},
+      "editable": true,
+      "graphTooltip": 1,
+      "panels": [
+        {"type":"timeseries","title":"Inference request rate","gridPos":{"h":8,"w":12,"x":0,"y":0},"targets":[{"expr":"rate(inference_service_requests_total[5m])","legendFormat":"{{service}}","refId":"A"}]},
+        {"type":"timeseries","title":"Tokens per second","gridPos":{"h":8,"w":12,"x":12,"y":0},"targets":[{"expr":"inference_service_last_tokens_per_second","legendFormat":"{{service}}","refId":"A"}]},
+        {"type":"timeseries","title":"TTFT seconds","gridPos":{"h":8,"w":12,"x":0,"y":8},"targets":[{"expr":"inference_service_last_ttft_seconds","legendFormat":"{{service}}","refId":"A"}]},
+        {"type":"timeseries","title":"TPOT seconds per token","gridPos":{"h":8,"w":12,"x":12,"y":8},"targets":[{"expr":"inference_service_last_tpot_seconds","legendFormat":"{{service}}","refId":"A"}]},
+        {"type":"timeseries","title":"GPU utilization","gridPos":{"h":8,"w":12,"x":0,"y":16},"targets":[{"expr":"gpu_utilization_percent","legendFormat":"{{node}} GPU {{gpu}}","refId":"A"}]},
+        {"type":"timeseries","title":"GPU memory used (MB)","gridPos":{"h":8,"w":12,"x":12,"y":16},"targets":[{"expr":"gpu_memory_used_mb","legendFormat":"{{node}} GPU {{gpu}}","refId":"A"}]}
+      ],
+      "schemaVersion": 39,
+      "style": "dark",
+      "tags": ["gpuops", "inference"],
+      "templating": {"list": []},
+      "time": {"from": "now-1h", "to": "now"},
+      "title": "GPUOps Inference",
+      "uid": "gpuops-inference",
+      "version": 1
+    }

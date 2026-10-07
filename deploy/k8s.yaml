@@ -24,6 +24,7 @@ spec:
             - {name: CLUSTER_MODE, value: real}
             - {name: DATABASE_URL, value: postgresql+psycopg://cluster:change-me@gpuops-postgres:5432/gpuops}
             - {name: AUTH_ENABLED, value: "false"}
+            - {name: INFERENCE_ENDPOINT, value: http://vllm-inference.gpuops.svc.cluster.local:8000/v1}
 ---
 apiVersion: v1
 kind: Service
@@ -31,5 +32,4 @@ metadata: {name: gpu-cluster-ops, namespace: gpuops}
 spec:
   selector: {app: gpu-cluster-ops}
   ports: [{port: 8000, targetPort: 8000}]
-
 

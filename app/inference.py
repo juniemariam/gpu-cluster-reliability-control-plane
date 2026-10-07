@@ -7,6 +7,7 @@ local development and tests CPU-only.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import json
 import os
 import time
 from typing import Any
@@ -37,6 +38,10 @@ class InferenceService:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     last_error: str | None = None
+    last_duration_seconds: float = 0.0
+    last_ttft_seconds: float = 0.0
+    last_tpot_seconds: float = 0.0
+    last_tokens_per_second: float = 0.0
 
 
 class InferenceRuntime:
@@ -63,6 +68,31 @@ class MockRuntime(InferenceRuntime):
         }
         return response, prompt_tokens, completion_tokens
 
+    def stream(self, service: InferenceService, payload: dict[str, Any]):
+        messages = payload.get("messages") or []
+        last = messages[-1].get("content", "") if messages else ""
+        content = f"{service.model} mock response: {last}".strip()
+        prompt_tokens = sum(len(str(m.get("content", "")).split()) for m in messages)
+        words = content.split()
+        response_id = f"chatcmpl-{service.name}-{service.requests}"
+        for index, word in enumerate(words):
+            yield {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": service.model,
+                "choices": [{"index": 0, "delta": {"content": word + (" " if index < len(words) - 1 else "")}, "finish_reason": None}],
+                "_prompt_tokens": prompt_tokens,
+            }
+        yield {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": service.model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(words), "total_tokens": prompt_tokens + len(words)},
+        }
+
 
 class OpenAICompatibleRuntime(InferenceRuntime):
     """Adapter for vLLM, SGLang, TGI-compatible gateways, or another server."""
@@ -75,11 +105,30 @@ class OpenAICompatibleRuntime(InferenceRuntime):
         except ImportError as exc:
             raise RuntimeError("httpx is required for an OpenAI-compatible runtime") from exc
         body = {**payload, "model": payload.get("model", service.model), "stream": False}
-        response = httpx.post(service.endpoint.rstrip("/") + "/chat/completions", json=body, timeout=120)
+        response = httpx.post(service.endpoint.rstrip("/") + "/chat/completions", json=body, timeout=120, trust_env=False)
         response.raise_for_status()
         data = response.json()
         usage = data.get("usage") or {}
         return data, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+
+    def stream(self, service: InferenceService, payload: dict[str, Any]):
+        if not service.endpoint:
+            raise ValueError("endpoint is required for an OpenAI-compatible runtime")
+        try:
+            import httpx
+        except ImportError as exc:
+            raise RuntimeError("httpx is required for an OpenAI-compatible runtime") from exc
+        body = {**payload, "model": payload.get("model", service.model), "stream": True}
+        body.setdefault("stream_options", {"include_usage": True})
+        with httpx.stream("POST", service.endpoint.rstrip("/") + "/chat/completions", json=body, timeout=120, trust_env=False) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    continue
+                yield json.loads(data)
 
 
 class InferenceManager:
@@ -135,6 +184,56 @@ class InferenceManager:
             raise
         finally:
             self.total_duration_seconds += time.perf_counter() - started
+            service.updated_at = utc_now()
+
+    def stream_chat(self, name: str, payload: dict[str, Any]):
+        service = self.get(name)
+        if service.state == InferenceServiceState.STOPPED:
+            raise RuntimeError(f"inference service is stopped: {name}")
+        started = time.perf_counter()
+        first_token_at = None
+        completion_tokens = 0
+        prompt_tokens = 0
+        self.request_count += 1
+        service.requests += 1
+        try:
+            for chunk in self.runtimes[name].stream(service, payload):
+                choices = chunk.get("choices") or []
+                delta = choices[0].get("delta") or {} if choices else {}
+                content = delta.get("content") or ""
+                if content and first_token_at is None:
+                    first_token_at = time.perf_counter()
+                if content:
+                    completion_tokens += 1
+                usage = chunk.get("usage") or {}
+                prompt_tokens = int(usage.get("prompt_tokens", chunk.get("_prompt_tokens", prompt_tokens)))
+                if usage.get("completion_tokens") is not None:
+                    completion_tokens = int(usage["completion_tokens"])
+                public_chunk = {key: value for key, value in chunk.items() if not key.startswith("_")}
+                yield f"data: {json.dumps(public_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as exc:
+            self.error_count += 1
+            service.errors += 1
+            service.state = InferenceServiceState.DEGRADED
+            service.last_error = type(exc).__name__
+            yield f"event: error\ndata: {json.dumps({'error': type(exc).__name__})}\n\n"
+        finally:
+            finished = time.perf_counter()
+            duration = finished - started
+            ttft = (first_token_at - started) if first_token_at is not None else duration
+            decode_duration = max(duration - ttft, 0.0)
+            tpot = decode_duration / completion_tokens if completion_tokens else 0.0
+            tokens_per_second = completion_tokens / decode_duration if decode_duration > 0 and completion_tokens else 0.0
+            service.prompt_tokens += prompt_tokens
+            service.completion_tokens += completion_tokens
+            service.last_duration_seconds = duration
+            service.last_ttft_seconds = ttft
+            service.last_tpot_seconds = tpot
+            service.last_tokens_per_second = tokens_per_second
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
+            self.total_duration_seconds += duration
             service.updated_at = utc_now()
 
     def stop(self, name: str) -> InferenceService:

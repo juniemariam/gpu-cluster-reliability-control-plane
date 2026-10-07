@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from .agent import AIOpsAgent
 from .cluster import Cluster
@@ -42,6 +42,9 @@ def job_json(job):
 
 def inference_json(service):
     return {**service.__dict__, "state": service.state.value, "created_at": service.created_at.isoformat(), "updated_at": service.updated_at.isoformat()}
+
+def prom_escape(value):
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 class JobRequest(BaseModel):
     name: str; image: str = "python:3.12-slim"; gpu_count: int = Field(ge=1, le=16); priority: int = Field(default=0, ge=0, le=100); command: list[str] = []; idempotency_key: str | None = Field(default=None, max_length=200); max_retries: int = Field(default=3, ge=0, le=10)
@@ -213,7 +216,15 @@ def stop_inference_service(name: str, user=Depends(require_role("operator", "adm
 @app.post("/api/v1/inference/services/{name}/chat/completions")
 def chat_completion(name: str, req: ChatCompletionRequest, user=Depends(current_user)):
     if req.stream:
-        raise HTTPException(501, "streaming is planned for the next inference milestone")
+        try:
+            inference.get(name)
+        except KeyError:
+            raise HTTPException(404, "inference service not found")
+        return StreamingResponse(
+            inference.stream_chat(name, req.model_dump(exclude_none=True)),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
     try:
         response = inference.chat(name, req.model_dump(exclude_none=True))
     except KeyError:
@@ -255,7 +266,30 @@ def metrics():
         "# HELP inference_services_total Registered inference services",
         "# TYPE inference_services_total gauge",
         f"inference_services_total {len(inference.services)}",
+        "# HELP inference_request_duration_seconds_total Total inference request duration",
+        "# TYPE inference_request_duration_seconds_total counter",
+        f"inference_request_duration_seconds_total {inference.total_duration_seconds}",
+        "# HELP inference_time_to_first_token_seconds_last Last observed time to first token",
+        "# TYPE inference_time_to_first_token_seconds_last gauge",
+        f"inference_time_to_first_token_seconds_last {max((s.last_ttft_seconds for s in inference.services.values()), default=0.0)}",
+        "# HELP inference_tokens_per_second_last Last observed generated token rate",
+        "# TYPE inference_tokens_per_second_last gauge",
+        f"inference_tokens_per_second_last {max((s.last_tokens_per_second for s in inference.services.values()), default=0.0)}",
     ]
+    for service in inference.services.values():
+        labels = f'service="{prom_escape(service.name)}",runtime="{prom_escape(service.runtime)}"'
+        model_labels = f'{labels},model="{prom_escape(service.model)}"'
+        lines += [
+            f"inference_service_requests_total{{{labels}}} {service.requests}",
+            f"inference_service_errors_total{{{labels}}} {service.errors}",
+            f"inference_service_prompt_tokens_total{{{labels}}} {service.prompt_tokens}",
+            f"inference_service_completion_tokens_total{{{labels}}} {service.completion_tokens}",
+            f"inference_service_last_duration_seconds{{{labels}}} {service.last_duration_seconds}",
+            f"inference_service_last_ttft_seconds{{{labels}}} {service.last_ttft_seconds}",
+            f"inference_service_last_tpot_seconds{{{labels}}} {service.last_tpot_seconds}",
+            f"inference_service_last_tokens_per_second{{{labels}}} {service.last_tokens_per_second}",
+            f'inference_service_info{{{model_labels},state="{prom_escape(service.state.value)}"}} 1',
+        ]
     return "\n".join(lines) + "\n"
 
 @app.get("/")

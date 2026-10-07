@@ -35,4 +35,22 @@ class PlatformTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             manager.register(InferenceService("demo", "model"))
 
+    def test_openai_runtime_requires_endpoint_at_request_time(self):
+        manager = InferenceManager()
+        manager.register(InferenceService("vllm", "model", runtime="vllm"))
+        with self.assertRaises(ValueError):
+            manager.chat("vllm", {"messages": [{"role": "user", "content": "hello"}]})
+
+    def test_mock_stream_records_latency_and_throughput(self):
+        manager = InferenceManager()
+        manager.register(InferenceService("stream", "demo-model"))
+        chunks = list(manager.stream_chat("stream", {"messages": [{"role": "user", "content": "hello"}]}))
+        self.assertTrue(any("chat.completion.chunk" in chunk for chunk in chunks))
+        self.assertTrue(chunks[-1].startswith("data: [DONE]"))
+        service = manager.get("stream")
+        self.assertEqual(service.requests, 1)
+        self.assertGreater(service.completion_tokens, 0)
+        self.assertGreaterEqual(service.last_ttft_seconds, 0)
+        self.assertGreaterEqual(service.last_tokens_per_second, 0)
+
 if __name__ == "__main__": unittest.main()

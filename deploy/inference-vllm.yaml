@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-inference-config
+  namespace: gpuops
+data:
+  # Replace this with the model you want to serve. This small instruct model
+  # is suitable for an initial GPU smoke test.
+  MODEL_ID: Qwen/Qwen2.5-1.5B-Instruct
+  MODEL_NAME: Qwen/Qwen2.5-1.5B-Instruct
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-inference
+  namespace: gpuops
+  labels:
+    app: vllm-inference
+    gpuops/workload-kind: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-inference
+  template:
+    metadata:
+      labels:
+        app: vllm-inference
+        gpuops/workload-kind: inference
+    spec:
+      runtimeClassName: nvidia
+      containers:
+        - name: vllm
+          # Pin this image to a tested vLLM release before production use.
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --model
+            - $(MODEL_ID)
+            - --served-model-name
+            - $(MODEL_NAME)
+            - --max-model-len
+            - "4096"
+            - --gpu-memory-utilization
+            - "0.90"
+          env:
+            - name: MODEL_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: vllm-inference-config
+                  key: MODEL_ID
+            - name: MODEL_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: vllm-inference-config
+                  key: MODEL_NAME
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: huggingface-token
+                  key: HF_TOKEN
+                  optional: true
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 90
+            periodSeconds: 20
+          volumeMounts:
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+      volumes:
+        - name: model-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-inference
+  namespace: gpuops
+  labels:
+    app: vllm-inference
+spec:
+  selector:
+    app: vllm-inference
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
